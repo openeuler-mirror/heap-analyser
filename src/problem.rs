@@ -23,8 +23,8 @@ use serde::Serialize;
 ///
 /// Serialised with an internal `kind` tag, e.g.
 /// `{"kind": "missing_symbol", "symbol": "main_arena"}`. The tag values are a
-/// public part of the JSON schema (see the `problems` section of the README),
-/// so they only change with a `schema_version` bump.
+/// public part of the JSON schema (see the `problems` section of the README).
+/// Existing kinds stay stable; consumers must ignore kinds added later.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Problem {
@@ -44,6 +44,9 @@ pub enum Problem {
     MissingBuildId,
     /// glibc version detection failed; safe-linking was assumed on by default.
     UnknownGlibcVersion,
+    /// DWARF was present, but its malloc layout was unusable. The built-in
+    /// layout was kept.
+    DwarfLayoutFallback { reason: String },
 
     /// A fastbin chain looped or exceeded the traversal cap.
     FastbinCycleDetected { arena: u32, bin_index: u32 },

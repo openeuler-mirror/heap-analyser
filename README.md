@@ -21,8 +21,8 @@ cargo build --release
 ## Usage
 
 ```
-heap-analyser report <coredump> [--libc PATH] [--force-libc MAPPED_PATH]
-heap-analyser check  --libc PATH
+heap-analyser report <coredump> [--libc PATH] [--libc-debug PATH] [--force-libc MAPPED_PATH]
+heap-analyser check  --libc PATH [--libc-debug PATH]
 ```
 
 ### `report`
@@ -33,9 +33,10 @@ Analyse a core and print the heap report to stdout as JSON.
 heap-analyser report ./core.1234 --libc ./libc.so.6.full
 ```
 
-- `--libc PATH` — the reference libc to read layout/symbols from. If omitted,
-  the libc mapped in the core is used, which only works when that local file
-  still has symbols (usually it doesn't — see *Getting a usable libc* below).
+- `--libc PATH` — the runtime libc used by the core. If omitted, the mapped
+  local libc is used. Without `--libc-debug`, this file must still have symbols.
+- `--libc-debug PATH` — matching debuginfo for a stripped `--libc`. Its build-id
+  and ELF ABI must match the runtime libc.
 - `--force-libc MAPPED_PATH` — trust the mapping whose path is `MAPPED_PATH` as
   libc without verifying its build-id/content. `verified` in the output is then
   `false`.
@@ -62,7 +63,15 @@ separate debuginfo file. Neither alone is enough:
 - the `*.debug` companion has the symbols but its `.rela.dyn`/`.gnu.version_d`
   are `NOBITS`.
 
-Combine them with `eu-unstrip`:
+Pass both files directly:
+
+```sh
+heap-analyser report core.1234 \
+    --libc /usr/lib64/libc.so.6 \
+    --libc-debug /usr/lib/debug/.../libc.so.6-<ver>.debug
+```
+
+Alternatively, combine them with `eu-unstrip`:
 
 ```sh
 eu-unstrip /usr/lib64/libc.so.6 \
@@ -92,6 +101,7 @@ ordinary (unsorted/small/large) bin:
     "verified": true
   },
   "glibc_capabilities": {
+    "layout_source": "dwarf",
     "has_tcache": true,
     "has_safe_linking": true,
     "version_source": "gnu_version_d"
@@ -168,6 +178,7 @@ ordinary (unsorted/small/large) bin:
 
 | Field | Meaning |
 |---|---|
+| `layout_source` | `dwarf` when the malloc structure layout came from validated DWARF; otherwise `builtin`. |
 | `has_tcache` | tcache present (glibc ≥ 2.26). |
 | `has_safe_linking` | free-list pointer mangling in effect (glibc ≥ 2.32); governs whether fastbin/tcache pointers are de-obfuscated. |
 | `version_source` | `gnu_version_d` (version read from the libc's `.gnu.version_d`) or `assumed_default` (detection failed; safe-linking assumed on). |
@@ -200,7 +211,8 @@ always present with both arrays (empty when there is no tcache).
 
 Each entry in `problems` is an object with a `kind` field plus context fields
 (`arena`, `thread_id`, `bin_index`, `address`, `size`, `reason`, `symbol`,
-`machine` — whichever apply). The kinds:
+`machine` — whichever apply). New non-fatal kinds may be added; consumers should
+ignore kinds they do not recognise. The current kinds are:
 
 | `kind` | Meaning | Fatal? |
 |---|---|---|
@@ -210,6 +222,7 @@ Each entry in `problems` is an object with a `kind` field plus context fields
 | `missing_relocation` | The TP-offset relocation is absent; tcache / `thread_arena` data can't be read. | no |
 | `missing_build_id` | The reference libc has no build-id; identity fell back to a content hash. | no |
 | `unknown_glibc_version` | Version detection failed; safe-linking was assumed on. | no |
+| `dwarf_layout_fallback` | DWARF layout extraction failed; the built-in layout was retained. | no |
 | `fastbin_cycle_detected` | A fastbin chain looped or hit the traversal cap. | no |
 | `fastbin_chunk_read_failed` | A fastbin head/node read failed; the bin count is partial. | no |
 | `tcache_cycle_detected` | A tcache chain looped or hit the traversal cap. | no |

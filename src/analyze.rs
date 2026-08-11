@@ -24,7 +24,7 @@ use crate::arch::by_elf_machine;
 use crate::elf::coredump::{self, Thread};
 use crate::elf::{Elf, Image};
 use crate::error::{Error, Result};
-use crate::glibc::DetectedLayout;
+use crate::glibc::{verify_debug_matches_runtime, DetectedLayout};
 use crate::heap::arena::{self, Arena};
 use crate::heap::stats::accumulate;
 use crate::heap::{fastbin, heap_list, tcache, walk};
@@ -40,6 +40,15 @@ pub fn analyze_core(
     libc_ref_path: Option<&Path>,
     force_libc: Option<&str>,
 ) -> Result<Report> {
+    analyze_core_with_debug(core_path, libc_ref_path, force_libc, None)
+}
+
+pub fn analyze_core_with_debug(
+    core_path: &Path,
+    libc_ref_path: Option<&Path>,
+    force_libc: Option<&str>,
+    libc_debug_path: Option<&Path>,
+) -> Result<Report> {
     let core_image = Image::load(core_path)?;
     let core = core_image.parse()?;
 
@@ -48,8 +57,7 @@ pub fn analyze_core(
     let threads = coredump::threads(&notes, arch)?;
     let mapped = coredump::mapped_files(&notes, core.is_64bit())?;
 
-    // The reference libc: an explicit --libc, otherwise the libc mapped in the
-    // core (only useful when the local file still has symbols).
+    // Use the explicit runtime libc, or open the path recorded in the core.
     let ref_image = match libc_ref_path {
         Some(p) => Image::load(p)?,
         None => {
@@ -66,7 +74,13 @@ pub fn analyze_core(
     };
     let reference = ref_image.parse()?;
 
-    let layout = DetectedLayout::detect(&reference, arch);
+    let debug_image = libc_debug_path.map(Image::load).transpose()?;
+    let debug = debug_image.as_ref().map(Image::parse).transpose()?;
+    if let Some(debug) = debug.as_ref() {
+        verify_debug_matches_runtime(&reference, debug).map_err(Error::UnusableLibc)?;
+    }
+
+    let layout = DetectedLayout::detect_with_debug(&reference, debug.as_ref(), arch);
     // Start the global problem list from detection so MissingRelocation /
     // UnknownGlibcVersion / DuplicateSymbol reach the final report.
     let mut problems = layout.problems.clone();

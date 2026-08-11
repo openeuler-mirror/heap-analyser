@@ -24,6 +24,7 @@ fn check_on_non_libc_elf_reports_unsupported() {
         serde_json::from_slice(&out.stdout).expect("stdout should be valid JSON");
     assert_eq!(json["schema_version"], 1);
     assert_eq!(json["supported"], false);
+    assert_eq!(json["glibc_capabilities"]["layout_source"], "builtin");
     assert_eq!(json["symbols"]["main_arena"]["present"], false);
 
     let problems = json["problems"].as_array().expect("problems array");
@@ -33,6 +34,32 @@ fn check_on_non_libc_elf_reports_unsupported() {
             .any(|p| p["kind"] == "missing_symbol" && p["symbol"] == "main_arena"),
         "expected a missing_symbol problem for main_arena, got {problems:?}"
     );
+}
+
+#[test]
+fn matching_debug_file_is_accepted_and_reports_layout_fallback() {
+    let elf = non_libc_elf();
+    let out = run(&["check", "--libc", elf, "--libc-debug", elf]);
+    assert_eq!(out.status.code(), Some(1));
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout should be valid JSON");
+    assert_eq!(json["glibc_capabilities"]["layout_source"], "builtin");
+    assert!(json["problems"]
+        .as_array()
+        .expect("problems array")
+        .iter()
+        .any(|problem| problem["kind"] == "dwarf_layout_fallback"));
+}
+
+#[test]
+fn mismatched_debug_file_fails_before_json_output() {
+    let debug = std::env::current_exe().expect("current test executable");
+    let debug = debug.to_str().expect("UTF-8 test executable path");
+    let out = run(&["check", "--libc", non_libc_elf(), "--libc-debug", debug]);
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("identity does not match"));
 }
 
 #[test]

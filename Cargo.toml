@@ -11,6 +11,8 @@ categories = ["command-line-utilities", "development-tools::debugging"]
 
 [dependencies]
 goblin = "0.9"
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+gimli = { version = "0.31", default-features = false, features = ["read"] }
 memmap2 = "0.9"
 sha2 = "0.10"
 thiserror = "2.0"

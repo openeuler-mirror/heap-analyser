@@ -19,6 +19,9 @@
 //! HEAP_ANALYSER_TEST_LIBC=./libc.so.6.full \
 //! cargo test --test report_real_core -- --include-ignored
 //! ```
+//!
+//! Set `HEAP_ANALYSER_TEST_LIBC_DEBUG` as well when the reference libc is
+//! stripped and its debuginfo is stored separately.
 
 mod common;
 
@@ -34,7 +37,12 @@ fn report_on_real_core_has_valid_schema() {
         panic!("set HEAP_ANALYSER_TEST_CORE and HEAP_ANALYSER_TEST_LIBC to run this test");
     };
 
-    let out = run(&["report", &core, "--libc", &libc]);
+    let debug = std::env::var("HEAP_ANALYSER_TEST_LIBC_DEBUG").ok();
+    let mut args = vec!["report", &core, "--libc", &libc];
+    if let Some(debug) = debug.as_ref() {
+        args.extend(["--libc-debug", debug]);
+    }
+    let out = run(&args);
     assert!(
         out.status.success(),
         "report failed: {}",
@@ -44,6 +52,10 @@ fn report_on_real_core_has_valid_schema() {
     let json: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("stdout should be valid JSON");
     assert_eq!(json["schema_version"], 1);
+    assert!(matches!(
+        json["glibc_capabilities"]["layout_source"].as_str(),
+        Some("builtin" | "dwarf")
+    ));
 
     let arenas = json["arenas"].as_array().expect("arenas array");
     assert!(!arenas.is_empty(), "expected at least the main arena");
@@ -78,10 +90,12 @@ fn analyze_core_in_process_is_self_consistent() {
         panic!("set HEAP_ANALYSER_TEST_CORE and HEAP_ANALYSER_TEST_LIBC to run this test");
     };
 
-    let report = heap_analyser::analyze::analyze_core(
+    let debug = std::env::var("HEAP_ANALYSER_TEST_LIBC_DEBUG").ok();
+    let report = heap_analyser::analyze::analyze_core_with_debug(
         std::path::Path::new(&core),
         Some(std::path::Path::new(&libc)),
         None,
+        debug.as_deref().map(std::path::Path::new),
     )
     .expect("analyze_core should succeed on a clean core");
 

@@ -77,6 +77,9 @@ impl From<Identity> for IdentityJson {
 
 #[derive(Serialize)]
 pub struct GlibcCapabilitiesJson {
+    /// `"dwarf"` when all required malloc offsets came from one validated
+    /// DWARF layout; otherwise `"builtin"`.
+    pub layout_source: String,
     pub has_tcache: bool,
     pub has_safe_linking: bool,
     /// `"gnu_version_d"` or `"assumed_default"` — a stable string, never a
@@ -88,6 +91,7 @@ impl GlibcCapabilitiesJson {
     pub fn from_layout(layout: &DetectedLayout) -> Self {
         let caps = &layout.capabilities;
         GlibcCapabilitiesJson {
+            layout_source: layout.layout_source.as_str().to_string(),
             has_tcache: caps.has_tcache,
             has_safe_linking: caps.has_safe_linking,
             version_source: caps.version_source.as_str().to_string(),
