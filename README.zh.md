@@ -19,8 +19,8 @@ cargo build --release
 ## 用法
 
 ```
-heap-analyser report <coredump> [--libc PATH] [--force-libc MAPPED_PATH]
-heap-analyser check  --libc PATH
+heap-analyser report <coredump> [--libc PATH] [--libc-debug PATH] [--force-libc MAPPED_PATH]
+heap-analyser check  --libc PATH [--libc-debug PATH]
 ```
 
 ### `report`
@@ -31,8 +31,10 @@ heap-analyser check  --libc PATH
 heap-analyser report ./core.1234 --libc ./libc.so.6.full
 ```
 
-- `--libc PATH` —— 用于读取布局/符号的参考 libc。省略时使用 core 里映射的 libc，但这只有在
-  本地那个文件仍带符号时才有用（通常不带——见下文*获取一个可用的 libc*）。
+- `--libc PATH` —— core 使用的运行时 libc。省略时使用 core 里映射的本地 libc；若未指定
+  `--libc-debug`，该文件必须仍带符号。
+- `--libc-debug PATH` —— stripped `--libc` 对应的 debuginfo；其 build-id 和 ELF ABI 必须与
+  运行时 libc 一致。
 - `--force-libc MAPPED_PATH` —— 直接信任路径为 `MAPPED_PATH` 的那个映射为 libc，不校验它的
   build-id/内容。此时输出中的 `verified` 为 `false`。
 
@@ -56,7 +58,15 @@ relocation，会导致 tcache/线程数据不可用）仍会保持 `supported: t
 - stripped 的 `libc.so.6` 有 TLS relocation，但没有符号；
 - `*.debug` 伴随文件有符号，但其 `.rela.dyn`/`.gnu.version_d` 是 `NOBITS`。
 
-用 `eu-unstrip` 合成：
+可以直接同时传入两个文件：
+
+```sh
+heap-analyser report core.1234 \
+    --libc /usr/lib64/libc.so.6 \
+    --libc-debug /usr/lib/debug/.../libc.so.6-<ver>.debug
+```
+
+也可以用 `eu-unstrip` 合成：
 
 ```sh
 eu-unstrip /usr/lib64/libc.so.6 \
@@ -85,6 +95,7 @@ heap-analyser report core.1234 --libc libc.so.6.full
     "verified": true
   },
   "glibc_capabilities": {
+    "layout_source": "dwarf",
     "has_tcache": true,
     "has_safe_linking": true,
     "version_source": "gnu_version_d"
@@ -161,6 +172,7 @@ heap-analyser report core.1234 --libc libc.so.6.full
 
 | 字段 | 含义 |
 |---|---|
+| `layout_source` | malloc 结构布局来自通过校验的 DWARF 时为 `dwarf`，否则为 `builtin`。 |
 | `has_tcache` | 存在 tcache（glibc ≥ 2.26）。 |
 | `has_safe_linking` | 空闲链表指针混淆生效（glibc ≥ 2.32）；决定是否对 fastbin/tcache 指针做反混淆。 |
 | `version_source` | `gnu_version_d`（版本读自 libc 的 `.gnu.version_d`）或 `assumed_default`（探测失败，默认按启用 safe-linking 处理）。 |
@@ -192,7 +204,7 @@ heap-analyser report core.1234 --libc libc.so.6.full
 
 `problems` 中的每一项都是一个带 `kind` 字段的对象，外加相应的上下文字段（`arena`、
 `thread_id`、`bin_index`、`address`、`size`、`reason`、`symbol`、`machine`——按适用情况）。
-各类型：
+后续可能增加新的非致命类型，消费者应忽略无法识别的类型。当前类型如下：
 
 | `kind` | 含义 | 致命? |
 |---|---|---|
@@ -202,6 +214,7 @@ heap-analyser report core.1234 --libc libc.so.6.full
 | `missing_relocation` | 缺少 TP-offset relocation；无法读取 tcache / `thread_arena` 数据。 | 否 |
 | `missing_build_id` | 参考 libc 无 build-id；身份退化为内容哈希。 | 否 |
 | `unknown_glibc_version` | 版本探测失败；默认按启用 safe-linking 处理。 | 否 |
+| `dwarf_layout_fallback` | DWARF 布局提取失败，继续使用内置布局。 | 否 |
 | `fastbin_cycle_detected` | fastbin 链成环或触及遍历上限。 | 否 |
 | `fastbin_chunk_read_failed` | 读取 fastbin 头/节点失败；该 bin 计数为部分结果。 | 否 |
 | `tcache_cycle_detected` | tcache 链成环或触及遍历上限。 | 否 |

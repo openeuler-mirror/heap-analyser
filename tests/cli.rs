@@ -22,6 +22,19 @@ fn help_lists_both_subcommands() {
 }
 
 #[test]
+fn libc_debug_is_listed_for_check_and_report() {
+    for subcommand in ["check", "report"] {
+        let out = run(&[subcommand, "--help"]);
+        assert!(out.status.success());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("--libc-debug"),
+            "{subcommand} help should list --libc-debug"
+        );
+    }
+}
+
+#[test]
 fn missing_subcommand_is_an_error() {
     let out = run(&[]);
     assert!(!out.status.success());

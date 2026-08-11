@@ -10,11 +10,10 @@
 
 //! glibc structure layout and capability detection.
 //!
-//! [`DetectedLayout`] bundles everything an analysis needs to know about the
-//! reference libc: the struct offsets (chosen by word size and whether THP
-//! support shifts `malloc_par`), the resolved symbols, the TLS relocation, and
-//! the version-derived capabilities (tcache, safe-linking).
+//! [`DetectedLayout`] bundles the malloc structure offsets, resolved symbols,
+//! TLS relocation, and version-derived capabilities needed by the analysis.
 
+mod dwarf;
 mod heap_info;
 mod malloc_state;
 mod tcache;
@@ -22,6 +21,7 @@ pub mod version;
 
 use crate::arch::Arch;
 use crate::elf::Elf;
+use crate::locate::{compute_identity, Identity};
 use crate::problem::Problem;
 
 use heap_info::HeapInfoOffsets;
@@ -66,7 +66,23 @@ pub struct GlibcCapabilities {
     pub version_source: VersionSource,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutSource {
+    Builtin,
+    Dwarf,
+}
+
+impl LayoutSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LayoutSource::Builtin => "builtin",
+            LayoutSource::Dwarf => "dwarf",
+        }
+    }
+}
+
 pub struct DetectedLayout {
+    pub layout_source: LayoutSource,
     pub word_size: u32,
     pub header_size: u32,
     pub minsize: u32,
@@ -125,10 +141,18 @@ impl DetectedLayout {
     /// looking for a fatal problem — `check` still wants to report a stripped
     /// libc rather than error out.
     pub fn detect(elf: &Elf<'_>, arch: &dyn Arch) -> Self {
+        Self::detect_with_debug(elf, None, arch)
+    }
+
+    pub(crate) fn detect_with_debug(
+        elf: &Elf<'_>,
+        debug: Option<&Elf<'_>>,
+        arch: &dyn Arch,
+    ) -> Self {
         let word_size: u32 = if elf.is_64bit() { 8 } else { 4 };
         let mut problems = Vec::new();
 
-        let (symbols, sym_problems) = scan_symbols(elf);
+        let (symbols, sym_problems) = scan_symbols(elf, debug);
         problems.extend(sym_problems);
         if !symbols.main_arena.present {
             problems.push(Problem::MissingSymbol {
@@ -167,7 +191,8 @@ impl DetectedLayout {
 
         let capabilities = detect_capabilities(elf, symbols.tcache.present, &mut problems);
 
-        DetectedLayout {
+        let mut layout = DetectedLayout {
+            layout_source: LayoutSource::Builtin,
             word_size,
             header_size: word_size,
             minsize: if word_size == 8 { 32 } else { 16 },
@@ -197,16 +222,86 @@ impl DetectedLayout {
             tp_off_reloc_addr,
             capabilities,
             problems,
+        };
+
+        // Required offsets switch as one set. A failed extraction leaves the
+        // built-in layout untouched.
+        let dwarf_elf = debug.unwrap_or(elf);
+        match dwarf::extract_layout(dwarf_elf, layout.capabilities.has_tcache) {
+            Ok(dwarf) => layout.apply_dwarf(dwarf),
+            Err(dwarf::DwarfLayoutError::Unavailable) if debug.is_none() => {}
+            Err(error) => layout.problems.push(Problem::DwarfLayoutFallback {
+                reason: error.to_string(),
+            }),
+        }
+        layout
+    }
+
+    fn apply_dwarf(&mut self, layout: dwarf::DwarfLayout) {
+        self.layout_source = LayoutSource::Dwarf;
+        self.main_arena.size = u64::from(layout.malloc_state_size);
+        self.fastbin_array_offset = layout.fastbin_array_offset;
+        self.fastbin_count = layout.fastbin_count;
+        self.malloc_state_top_offset = layout.malloc_state_top_offset;
+        self.malloc_state_next_offset = layout.malloc_state_next_offset;
+        self.mp_sbrk_base_offset = layout.mp_sbrk_base_offset;
+        if let Some(offset) = layout.mp_arena_max_offset {
+            self.mp_arena_max_offset = offset;
+        }
+        if let Some(offset) = layout.mp_tcache_bins_offset {
+            self.mp_tcache_bins_offset = offset;
+        }
+        self.heap_info_size = layout.heap_info_size;
+        self.heap_info_ar_ptr_offset = layout.heap_info_ar_ptr_offset;
+        self.heap_info_prev_offset = layout.heap_info_prev_offset;
+        self.heap_info_size_offset = layout.heap_info_size_offset;
+        self.heap_info_mprotect_size_offset = layout.heap_info_mprotect_size_offset;
+        if let (Some(entries), Some(bins)) = (layout.tcache_entries_offset, layout.tcache_max_bins)
+        {
+            self.tcache_entries_offset = entries;
+            self.tcache_max_bins = bins;
         }
     }
 }
 
-fn scan_symbols(elf: &Elf<'_>) -> (Symbols, Vec<Problem>) {
-    let inner = elf.inner();
+/// Check that a separate debug ELF belongs to the runtime libc.
+pub(crate) fn verify_debug_matches_runtime(
+    runtime: &Elf<'_>,
+    debug: &Elf<'_>,
+) -> std::result::Result<(), String> {
+    if runtime.machine() != debug.machine() || runtime.is_64bit() != debug.is_64bit() {
+        return Err("debuginfo ABI does not match the runtime libc".to_string());
+    }
+    match (compute_identity(runtime), compute_identity(debug)) {
+        (Identity::BuildId(runtime), Identity::BuildId(candidate)) if runtime == candidate => {
+            Ok(())
+        }
+        (Identity::ContentHash(runtime), Identity::ContentHash(candidate))
+            if runtime == candidate =>
+        {
+            Ok(())
+        }
+        _ => Err("debuginfo identity does not match the runtime libc".to_string()),
+    }
+}
+
+fn scan_symbols(runtime: &Elf<'_>, debug: Option<&Elf<'_>>) -> (Symbols, Vec<Problem>) {
     let mut syms = Symbols::default();
     let mut problems = Vec::new();
+    // Prefer runtime symbols when present; debuginfo fills stripped entries.
+    fill_symbols(runtime, &mut syms, &mut problems);
+    if let Some(debug) = debug {
+        fill_symbols(debug, &mut syms, &mut problems);
+    }
+    (syms, problems)
+}
 
+fn fill_symbols(elf: &Elf<'_>, syms: &mut Symbols, problems: &mut Vec<Problem>) {
+    let inner = elf.inner();
     for sym in &inner.syms {
+        if sym.st_shndx == 0 {
+            continue;
+        }
         let Some(name) = inner.strtab.get_at(sym.st_name) else {
             continue;
         };
@@ -238,7 +333,6 @@ fn scan_symbols(elf: &Elf<'_>) -> (Symbols, Vec<Problem>) {
             size: sym.st_size,
         };
     }
-    (syms, problems)
 }
 
 /// The address the TLS block offset lives at: `r_offset` of the first
@@ -266,6 +360,7 @@ pub(crate) fn test_layout(word_size: u32) -> DetectedLayout {
         size: 0,
     };
     DetectedLayout {
+        layout_source: LayoutSource::Builtin,
         word_size,
         header_size: word_size,
         minsize: if word_size == 8 { 32 } else { 16 },

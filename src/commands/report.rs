@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use crate::analyze::analyze_core;
+use crate::analyze::analyze_core_with_debug;
 use crate::error::Result;
 use crate::report::json::JsonRenderer;
 use crate::report::Renderer;
@@ -20,10 +20,13 @@ pub struct ReportArgs {
     /// Path to the core dump to analyse.
     pub coredump: PathBuf,
 
-    /// Reference libc (with symbols) to read glibc layout from. Defaults to the
-    /// libc mapped in the core, if the local copy still has symbols.
+    /// Runtime libc used by the core. Defaults to the mapped local libc.
     #[arg(long)]
     pub libc: Option<PathBuf>,
+
+    /// Matching libc debuginfo used to read symbols and malloc structure layout.
+    #[arg(long = "libc-debug")]
+    pub libc_debug: Option<PathBuf>,
 
     /// Trust this mapped path as libc without verifying its identity.
     #[arg(long = "force-libc")]
@@ -34,10 +37,11 @@ pub struct ReportArgs {
 /// The report is fully built in memory before anything is written, so a failure
 /// never leaves half a document on stdout.
 pub fn run(args: ReportArgs) -> Result<i32> {
-    let report = analyze_core(
+    let report = analyze_core_with_debug(
         &args.coredump,
         args.libc.as_deref(),
         args.force_libc.as_deref(),
+        args.libc_debug.as_deref(),
     )?;
     JsonRenderer.render(&report, &mut std::io::stdout())?;
     println!();

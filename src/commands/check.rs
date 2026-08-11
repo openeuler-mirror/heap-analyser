@@ -19,16 +19,20 @@ use serde::Serialize;
 use crate::arch::{by_elf_machine, Arch};
 use crate::elf::{Elf, Image};
 use crate::error::Result;
-use crate::glibc::{DetectedLayout, SymbolInfo};
+use crate::glibc::{verify_debug_matches_runtime, DetectedLayout, SymbolInfo};
 use crate::locate::{compute_identity, Identity};
 use crate::problem::Problem;
 use crate::report::model::{GlibcCapabilitiesJson, IdentityJson, SCHEMA_VERSION};
 
 #[derive(clap::Args)]
 pub struct CheckArgs {
-    /// Reference libc to inspect.
+    /// Runtime libc to inspect.
     #[arg(long)]
     pub libc: std::path::PathBuf,
+
+    /// Matching libc debuginfo used to read symbols and malloc structure layout.
+    #[arg(long = "libc-debug")]
+    pub libc_debug: Option<std::path::PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -81,7 +85,13 @@ pub fn run(args: CheckArgs) -> Result<i32> {
         return Ok(1);
     };
 
-    let report = supported_report(&elf, arch, libc_path, identity);
+    let debug_image = args.libc_debug.as_deref().map(Image::load).transpose()?;
+    let debug = debug_image.as_ref().map(Image::parse).transpose()?;
+    if let Some(debug) = debug.as_ref() {
+        verify_debug_matches_runtime(&elf, debug).map_err(crate::error::Error::UnusableLibc)?;
+    }
+
+    let report = supported_report(&elf, debug.as_ref(), arch, libc_path, identity);
     let code = if report.supported { 0 } else { 1 };
     write_report(&report)?;
     Ok(code)
@@ -110,11 +120,12 @@ fn unsupported_report(elf: &Elf<'_>, libc_path: String, identity: Identity) -> C
 
 fn supported_report(
     elf: &Elf<'_>,
+    debug: Option<&Elf<'_>>,
     arch: &dyn Arch,
     libc_path: String,
     identity: Identity,
 ) -> CheckReport {
-    let layout = DetectedLayout::detect(elf, arch);
+    let layout = DetectedLayout::detect_with_debug(elf, debug, arch);
     let mut problems = layout.problems.clone();
     if matches!(identity, Identity::ContentHash(_)) {
         problems.push(Problem::MissingBuildId);

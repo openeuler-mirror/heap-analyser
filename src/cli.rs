@@ -28,6 +28,6 @@ pub struct Cli {
 pub enum Command {
     /// Analyse a core dump and print a JSON heap report.
     Report(ReportArgs),
-    /// Check whether a reference libc exposes the symbols and layout we need.
+    /// Check whether a runtime libc and its debuginfo provide the required data.
     Check(CheckArgs),
 }
