@@ -35,8 +35,8 @@ heap-analyser report ./core.1234 --libc ./libc.so.6.full
 
 - `--libc PATH` — the runtime libc used by the core. If omitted, the mapped
   local libc is used. Without `--libc-debug`, this file must still have symbols.
-- `--libc-debug PATH` — matching debuginfo for a stripped `--libc`. Its build-id
-  and ELF ABI must match the runtime libc.
+- `--libc-debug PATH` — matching debuginfo for a stripped `--libc`. Its ELF ABI
+  and build-id (or the runtime libc's `.gnu_debuglink` CRC) must match.
 - `--force-libc MAPPED_PATH` — trust the mapping whose path is `MAPPED_PATH` as
   libc without verifying its build-id/content. `verified` in the output is then
   `false`.

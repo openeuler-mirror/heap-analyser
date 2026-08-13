@@ -33,8 +33,8 @@ heap-analyser report ./core.1234 --libc ./libc.so.6.full
 
 - `--libc PATH` —— core 使用的运行时 libc。省略时使用 core 里映射的本地 libc；若未指定
   `--libc-debug`，该文件必须仍带符号。
-- `--libc-debug PATH` —— stripped `--libc` 对应的 debuginfo；其 build-id 和 ELF ABI 必须与
-  运行时 libc 一致。
+- `--libc-debug PATH` —— stripped `--libc` 对应的 debuginfo；其 ELF ABI 以及 build-id
+  （或运行时 libc 的 `.gnu_debuglink` CRC）必须匹配。
 - `--force-libc MAPPED_PATH` —— 直接信任路径为 `MAPPED_PATH` 的那个映射为 libc，不校验它的
   build-id/内容。此时输出中的 `verified` 为 `false`。
 
