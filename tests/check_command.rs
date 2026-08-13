@@ -10,7 +10,17 @@
 
 mod common;
 
-use common::{non_libc_elf, run};
+use common::{minimal_elf, non_libc_elf, run, ElfFixture};
+
+const EM_X86_64: u16 = 62;
+const EM_AARCH64: u16 = 183;
+
+fn check_elf_pair(runtime: &[u8], debug: &[u8]) -> std::process::Output {
+    let fixture = ElfFixture::new();
+    let runtime = fixture.write("libc.so.6", runtime);
+    let debug = fixture.write("libc.so.6.debug", debug);
+    run(&["check", "--libc", &runtime, "--libc-debug", &debug])
+}
 
 /// `check` on a valid ELF that isn't a libc: it parses, detects the arch, finds
 /// no glibc symbols, and says so with valid JSON and a non-zero exit — without
@@ -59,7 +69,106 @@ fn mismatched_debug_file_fails_before_json_output() {
     let out = run(&["check", "--libc", non_libc_elf(), "--libc-debug", debug]);
     assert!(!out.status.success());
     assert!(out.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("identity does not match"));
+    assert!(String::from_utf8_lossy(&out.stderr)
+        .contains("debuginfo build-id does not match the runtime libc"));
+}
+
+#[test]
+fn matching_section_build_ids_are_accepted() {
+    let build_id = b"matching build id";
+    let runtime = minimal_elf(EM_X86_64, Some(build_id), &[]);
+    let debug = minimal_elf(EM_X86_64, Some(build_id), &[]);
+    let out = check_elf_pair(&runtime, &debug);
+
+    // Pairing succeeded; the minimal ELF is not a libc, so `check` then emits
+    // its normal unsupported report with status 1.
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stderr.is_empty());
+    serde_json::from_slice::<serde_json::Value>(&out.stdout).expect("stdout should be valid JSON");
+}
+
+#[test]
+fn mismatched_build_ids_are_rejected_even_when_debuglink_matches() {
+    let debug = minimal_elf(EM_X86_64, Some(b"debug build id"), &[]);
+    let runtime = minimal_elf(
+        EM_X86_64,
+        Some(b"runtime build id"),
+        &[crc32fast::hash(&debug)],
+    );
+    let out = check_elf_pair(&runtime, &debug);
+
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr)
+        .contains("debuginfo build-id does not match the runtime libc"));
+}
+
+#[test]
+fn matching_debuglink_crc_is_accepted_without_shared_build_id() {
+    let debug = minimal_elf(EM_X86_64, None, &[]);
+    let runtime = minimal_elf(
+        EM_X86_64,
+        Some(b"runtime build id"),
+        &[crc32fast::hash(&debug)],
+    );
+    let out = check_elf_pair(&runtime, &debug);
+
+    // Pairing succeeded; the minimal ELF is not a libc, so `check` then emits
+    // its normal unsupported report with status 1.
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stderr.is_empty());
+    serde_json::from_slice::<serde_json::Value>(&out.stdout).expect("stdout should be valid JSON");
+}
+
+#[test]
+fn mismatched_debuglink_crc_is_rejected() {
+    let debug = minimal_elf(EM_X86_64, None, &[]);
+    let runtime = minimal_elf(EM_X86_64, None, &[crc32fast::hash(&debug) ^ 1]);
+    let out = check_elf_pair(&runtime, &debug);
+
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr)
+        .contains("debuginfo .gnu_debuglink CRC does not match the runtime libc"));
+}
+
+#[test]
+fn missing_build_id_and_debuglink_are_rejected() {
+    let runtime = minimal_elf(EM_X86_64, None, &[]);
+    let debug = minimal_elf(EM_X86_64, None, &[]);
+    let out = check_elf_pair(&runtime, &debug);
+
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no matching build-id or .gnu_debuglink CRC")
+    );
+}
+
+#[test]
+fn duplicate_debuglink_sections_are_rejected() {
+    let debug = minimal_elf(EM_X86_64, None, &[]);
+    let crc = crc32fast::hash(&debug);
+    let runtime = minimal_elf(EM_X86_64, None, &[crc, crc]);
+    let out = check_elf_pair(&runtime, &debug);
+
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr)
+        .contains("runtime libc has duplicate .gnu_debuglink sections"));
+}
+
+#[test]
+fn mismatched_debug_machine_is_rejected() {
+    let build_id = b"matching build id";
+    let runtime = minimal_elf(EM_X86_64, Some(build_id), &[]);
+    let debug = minimal_elf(EM_AARCH64, Some(build_id), &[]);
+    let out = check_elf_pair(&runtime, &debug);
+
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr)
+        .contains("debuginfo ABI does not match the runtime libc"));
 }
 
 #[test]

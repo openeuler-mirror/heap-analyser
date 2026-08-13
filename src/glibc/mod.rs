@@ -20,8 +20,7 @@ mod tcache;
 pub mod version;
 
 use crate::arch::Arch;
-use crate::elf::Elf;
-use crate::locate::{compute_identity, Identity};
+use crate::elf::{notes, Elf};
 use crate::problem::Problem;
 
 use heap_info::HeapInfoOffsets;
@@ -272,16 +271,84 @@ pub(crate) fn verify_debug_matches_runtime(
     if runtime.machine() != debug.machine() || runtime.is_64bit() != debug.is_64bit() {
         return Err("debuginfo ABI does not match the runtime libc".to_string());
     }
-    match (compute_identity(runtime), compute_identity(debug)) {
-        (Identity::BuildId(runtime), Identity::BuildId(candidate)) if runtime == candidate => {
+
+    let runtime_build_id = elf_build_id(runtime);
+    let debug_build_id = elf_build_id(debug);
+    if let (Some(runtime_id), Some(debug_id)) = (&runtime_build_id, &debug_build_id) {
+        return if runtime_id == debug_id {
             Ok(())
+        } else {
+            Err("debuginfo build-id does not match the runtime libc".to_string())
+        };
+    }
+
+    let expected_crc = debuglink_crc(runtime)?.ok_or_else(|| {
+        "runtime libc and debuginfo have no matching build-id or .gnu_debuglink CRC".to_string()
+    })?;
+    verify_debuglink_crc(expected_crc, debug.bytes())
+}
+
+fn elf_build_id(elf: &Elf<'_>) -> Option<Vec<u8>> {
+    notes::build_id(&elf.notes())
+        .or_else(|| notes::build_id_from_note_sections(elf.inner(), elf.bytes()))
+        .filter(|id| !id.is_empty())
+}
+
+fn debuglink_crc(elf: &Elf<'_>) -> std::result::Result<Option<u32>, String> {
+    let mut result = None;
+    for section in &elf.inner().section_headers {
+        if elf.inner().shdr_strtab.get_at(section.sh_name) != Some(".gnu_debuglink") {
+            continue;
         }
-        (Identity::ContentHash(runtime), Identity::ContentHash(candidate))
-            if runtime == candidate =>
-        {
-            Ok(())
+        if result.is_some() {
+            return Err("runtime libc has duplicate .gnu_debuglink sections".to_string());
         }
-        _ => Err("debuginfo identity does not match the runtime libc".to_string()),
+        let start = usize::try_from(section.sh_offset)
+            .map_err(|_| "runtime libc has invalid .gnu_debuglink offset".to_string())?;
+        let size = usize::try_from(section.sh_size)
+            .map_err(|_| "runtime libc has invalid .gnu_debuglink size".to_string())?;
+        let end = start
+            .checked_add(size)
+            .ok_or_else(|| "runtime libc has invalid .gnu_debuglink range".to_string())?;
+        let data = elf
+            .bytes()
+            .get(start..end)
+            .ok_or_else(|| "runtime libc has truncated .gnu_debuglink data".to_string())?;
+        result = Some(parse_debuglink_crc(data, elf.inner().little_endian)?);
+    }
+    Ok(result)
+}
+
+fn parse_debuglink_crc(data: &[u8], little_endian: bool) -> std::result::Result<u32, String> {
+    let nul = data
+        .iter()
+        .position(|byte| *byte == 0)
+        .filter(|offset| *offset > 0)
+        .ok_or_else(|| "runtime libc has malformed .gnu_debuglink data".to_string())?;
+    let crc_offset = nul
+        .checked_add(1)
+        .and_then(|offset| offset.checked_add(3))
+        .map(|offset| offset & !3)
+        .ok_or_else(|| "runtime libc has malformed .gnu_debuglink data".to_string())?;
+    let crc_end = crc_offset
+        .checked_add(4)
+        .ok_or_else(|| "runtime libc has malformed .gnu_debuglink data".to_string())?;
+    let bytes: [u8; 4] = data
+        .get(crc_offset..crc_end)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| "runtime libc has malformed .gnu_debuglink data".to_string())?;
+    Ok(if little_endian {
+        u32::from_le_bytes(bytes)
+    } else {
+        u32::from_be_bytes(bytes)
+    })
+}
+
+fn verify_debuglink_crc(expected: u32, debug: &[u8]) -> std::result::Result<(), String> {
+    if crc32fast::hash(debug) == expected {
+        Ok(())
+    } else {
+        Err("debuginfo .gnu_debuglink CRC does not match the runtime libc".to_string())
     }
 }
 
@@ -419,5 +486,42 @@ fn detect_capabilities(
                 version_source: VersionSource::AssumedDefault,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_debuglink_crc, verify_debuglink_crc};
+
+    #[test]
+    fn parses_debuglink_crc_in_target_byte_order() {
+        let crc = 0x1234_5678u32;
+        let mut little = b"libc.so.6.debug\0".to_vec();
+        little.resize((little.len() + 3) & !3, 0);
+        little.extend_from_slice(&crc.to_le_bytes());
+        assert_eq!(parse_debuglink_crc(&little, true).unwrap(), crc);
+
+        let mut big = b"libc.so.6.debug\0".to_vec();
+        big.resize((big.len() + 3) & !3, 0);
+        big.extend_from_slice(&crc.to_be_bytes());
+        assert_eq!(parse_debuglink_crc(&big, false).unwrap(), crc);
+    }
+
+    #[test]
+    fn rejects_malformed_debuglink_data() {
+        assert!(parse_debuglink_crc(b"libc.so.6.debug", true).is_err());
+        assert!(parse_debuglink_crc(b"\0\0\0\0", true).is_err());
+        assert!(parse_debuglink_crc(b"libc.so.6.debug\0", true).is_err());
+    }
+
+    #[test]
+    fn verifies_crc_over_the_complete_debug_file() {
+        let debug = b"complete debug file contents";
+        let expected = crc32fast::hash(debug);
+        assert!(verify_debuglink_crc(expected, debug).is_ok());
+
+        let mut changed = debug.to_vec();
+        changed[20] ^= 1;
+        assert!(verify_debuglink_crc(expected, &changed).is_err());
     }
 }

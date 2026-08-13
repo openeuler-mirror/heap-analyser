@@ -18,6 +18,7 @@
 //! (or `None`), never a panic.
 
 use goblin::elf::program_header::PT_NOTE;
+use goblin::elf::section_header::SHT_NOTE;
 
 use super::{read_u16_le, read_u32_le};
 
@@ -114,6 +115,33 @@ pub fn build_id(notes: &[Note<'_>]) -> Option<Vec<u8>> {
         .iter()
         .find(|n| n.note_type == NT_GNU_BUILD_ID && n.name == "GNU")
         .map(|n| n.desc.to_vec())
+}
+
+/// Read a build-id from `SHT_NOTE` sections. Separate debug files may retain
+/// the note section without a corresponding `PT_NOTE` program header.
+pub fn build_id_from_note_sections(elf: &goblin::elf::Elf<'_>, data: &[u8]) -> Option<Vec<u8>> {
+    for section in &elf.section_headers {
+        if section.sh_type != SHT_NOTE {
+            continue;
+        }
+        let (Ok(start), Ok(size)) = (
+            usize::try_from(section.sh_offset),
+            usize::try_from(section.sh_size),
+        ) else {
+            continue;
+        };
+        let Some(end) = start.checked_add(size) else {
+            continue;
+        };
+        let Some(section_data) = data.get(start..end) else {
+            continue;
+        };
+        let notes = walk_note_segment(section_data);
+        if let Some(id) = build_id(&notes) {
+            return Some(id);
+        }
+    }
+    None
 }
 
 /// Extract a build-id straight from a raw memory buffer that starts with an ELF
