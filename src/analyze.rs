@@ -24,6 +24,7 @@ use crate::arch::by_elf_machine;
 use crate::elf::coredump::{self, Thread};
 use crate::elf::{Elf, Image};
 use crate::error::{Error, Result};
+use crate::glibc::footprint;
 use crate::glibc::{verify_debug_matches_runtime, DetectedLayout};
 use crate::heap::arena::{self, Arena};
 use crate::heap::stats::accumulate;
@@ -33,7 +34,9 @@ use crate::locate::{
     NtFileLocator,
 };
 use crate::problem::Problem;
-use crate::report::model::{ArenaReport, GlibcCapabilitiesJson, LibcInfo, Report, SCHEMA_VERSION};
+use crate::report::model::{
+    ArenaReport, GlibcCapabilitiesJson, GlibcMallocSummary, LibcInfo, Report, SCHEMA_VERSION,
+};
 
 pub fn analyze_core(
     core_path: &Path,
@@ -99,8 +102,10 @@ pub fn analyze_core_with_debug(
         NtFileLocator.locate(&core, &identity)?
     };
     let libc_addr = located.load_addr;
+    let direct_mmap = footprint::direct_mmap_counters(&core, &layout, libc_addr);
 
     let (arenas, arena_problems) = arena::list(&core, &layout, libc_addr)?;
+    let arena_list_complete = arena_problems.is_empty();
     problems.extend(arena_problems);
 
     let TlsInfo {
@@ -109,7 +114,10 @@ pub fn analyze_core_with_debug(
     } = resolve_tls(&core, &layout, libc_addr, &arenas, &threads, &mut problems);
 
     let mut arena_reports = Vec::new();
+    let mut arena_system_values = Vec::with_capacity(arenas.len());
     for arena in &arenas {
+        let system_mem = footprint::arena_system_mem(&core, &layout, arena.malloc_state_addr);
+        arena_system_values.push(system_mem);
         let attached = attached_threads(arena, &threads, &thread_arena_map);
 
         let (heaps, heap_problems) = match heap_list::list(&core, &layout, libc_addr, arena) {
@@ -122,7 +130,12 @@ pub fn analyze_core_with_debug(
                     arena: arena.index,
                     reason: "heap list start unreadable".to_string(),
                 });
-                arena_reports.push(ArenaReport::stub(arena.index, arena.is_main(), attached));
+                arena_reports.push(ArenaReport::stub(
+                    arena.index,
+                    arena.is_main(),
+                    system_mem,
+                    attached,
+                ));
                 continue;
             }
         };
@@ -153,11 +166,22 @@ pub fn analyze_core_with_debug(
         arena_reports.push(ArenaReport::build(
             arena.index,
             arena.is_main(),
+            system_mem,
             attached,
             &heaps,
             &stats,
         ));
     }
+
+    let arena_system_bytes = if arena_list_complete {
+        arena_system_values
+            .iter()
+            .try_fold(0u64, |total, value| total.checked_add((*value)?))
+    } else {
+        None
+    };
+    let glibc_malloc =
+        GlibcMallocSummary::new(arena_system_bytes, direct_mmap.count, direct_mmap.bytes);
 
     Ok(Report {
         schema_version: SCHEMA_VERSION,
@@ -165,6 +189,7 @@ pub fn analyze_core_with_debug(
         core_path: core_path.display().to_string(),
         libc: LibcInfo::new(&located, identity),
         glibc_capabilities: GlibcCapabilitiesJson::from_layout(&layout),
+        glibc_malloc,
         problems,
         arenas: arena_reports,
     })
