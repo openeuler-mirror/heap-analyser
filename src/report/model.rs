@@ -32,8 +32,35 @@ pub struct Report {
     pub core_path: String,
     pub libc: LibcInfo,
     pub glibc_capabilities: GlibcCapabilitiesJson,
+    pub glibc_malloc: GlibcMallocSummary,
     pub problems: Vec<Problem>,
     pub arenas: Vec<ArenaReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GlibcMallocSummary {
+    pub arena_system_bytes: Option<u64>,
+    pub direct_mmap_count: Option<u64>,
+    pub direct_mmap_bytes: Option<u64>,
+    pub total_system_bytes: Option<u64>,
+}
+
+impl GlibcMallocSummary {
+    pub fn new(
+        arena_system_bytes: Option<u64>,
+        direct_mmap_count: Option<u64>,
+        direct_mmap_bytes: Option<u64>,
+    ) -> Self {
+        let total_system_bytes = arena_system_bytes
+            .zip(direct_mmap_bytes)
+            .and_then(|(arena, mmap)| arena.checked_add(mmap));
+        GlibcMallocSummary {
+            arena_system_bytes,
+            direct_mmap_count,
+            direct_mmap_bytes,
+            total_system_bytes,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -108,6 +135,7 @@ impl GlibcCapabilitiesJson {
 pub struct ArenaReport {
     pub index: u32,
     pub is_main: bool,
+    pub system_mem: Option<u64>,
     pub attached_threads: Vec<i32>,
     pub heaps: HeapsSummary,
     pub allocated: AllocatedSummary,
@@ -119,6 +147,7 @@ impl ArenaReport {
     pub fn build(
         index: u32,
         is_main: bool,
+        system_mem: Option<u64>,
         attached_threads: Vec<i32>,
         heaps: &[Heap],
         stats: &ArenaStats,
@@ -126,6 +155,7 @@ impl ArenaReport {
         ArenaReport {
             index,
             is_main,
+            system_mem,
             attached_threads,
             heaps: HeapsSummary::from_heaps(heaps),
             allocated: AllocatedSummary::from_tally(&stats.allocated),
@@ -139,10 +169,16 @@ impl ArenaReport {
 
     /// A placeholder entry for an arena that couldn't be walked, so
     /// `problems[].arena` still resolves to something in `arenas[]`.
-    pub fn stub(index: u32, is_main: bool, attached_threads: Vec<i32>) -> Self {
+    pub fn stub(
+        index: u32,
+        is_main: bool,
+        system_mem: Option<u64>,
+        attached_threads: Vec<i32>,
+    ) -> Self {
         ArenaReport {
             index,
             is_main,
+            system_mem,
             attached_threads,
             heaps: HeapsSummary {
                 count: 0,
@@ -311,5 +347,17 @@ mod tests {
         let json = serde_json::to_string(&IdentityJson::from(Identity::BuildId(vec![0xab, 0xcd])))
             .unwrap();
         assert_eq!(json, r#"{"kind":"build_id","value":"abcd"}"#);
+    }
+
+    #[test]
+    fn malloc_summary_adds_only_complete_byte_totals() {
+        let complete = GlibcMallocSummary::new(Some(100), Some(3), Some(40));
+        assert_eq!(complete.total_system_bytes, Some(140));
+
+        let partial = GlibcMallocSummary::new(None, Some(3), Some(40));
+        assert_eq!(partial.total_system_bytes, None);
+
+        let overflow = GlibcMallocSummary::new(Some(u64::MAX), Some(3), Some(1));
+        assert_eq!(overflow.total_system_bytes, None);
     }
 }

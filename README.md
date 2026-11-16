@@ -4,9 +4,10 @@
 
 Analyse the glibc `malloc` heap of an ELF core dump and print a machine-readable
 JSON report: per-arena allocated/free totals, size histograms, and the contents
-of the fastbin and tcache free lists.
+of the fastbin and tcache free lists, together with the arena and direct-mmap
+system memory currently managed by glibc malloc.
 
-It reads glibc's internal structures (`malloc_state`, `_heap_info`,
+It reads glibc's internal structures (`malloc_state`, `malloc_par`, `_heap_info`,
 `tcache_perthread_struct`) out of a core, so it needs a **reference libc with
 symbols** to know where those structures and their fields are.
 
@@ -106,11 +107,18 @@ ordinary (unsorted/small/large) bin:
     "has_safe_linking": true,
     "version_source": "gnu_version_d"
   },
+  "glibc_malloc": {
+    "arena_system_bytes": 8192,
+    "direct_mmap_count": 0,
+    "direct_mmap_bytes": 0,
+    "total_system_bytes": 8192
+  },
   "problems": [],
   "arenas": [
     {
       "index": 0,
       "is_main": true,
+      "system_mem": 8192,
       "attached_threads": [1234],
       "heaps": { "count": 1, "total_bytes": 7248, "committed_bytes": 7248 },
       "allocated": {
@@ -162,6 +170,7 @@ ordinary (unsorted/small/large) bin:
 | `core_path` | Path of the analysed core dump. |
 | `libc` | Which reference libc was used, and how it was matched. |
 | `glibc_capabilities` | glibc features detected from the reference libc. |
+| `glibc_malloc` | Arena, direct-mmap, and total system memory currently managed by glibc malloc. |
 | `problems` | Recoverable issues (see *Problem kinds*); `[]` means a clean analysis. |
 | `arenas` | Per-arena results, `index` 0 first. |
 
@@ -183,12 +192,24 @@ ordinary (unsorted/small/large) bin:
 | `has_safe_linking` | free-list pointer mangling in effect (glibc ≥ 2.32); governs whether fastbin/tcache pointers are de-obfuscated. |
 | `version_source` | `gnu_version_d` (version read from the libc's `.gnu.version_d`) or `assumed_default` (detection failed; safe-linking assumed on). |
 
+**`glibc_malloc`**
+
+| Field | Meaning |
+|---|---|
+| `arena_system_bytes` | Sum of all `arenas[].system_mem` values. Available only when the arena ring is complete and every value can be read. |
+| `direct_mmap_count` | Number of live direct-mmap allocations, read from `mp_.n_mmaps`. |
+| `direct_mmap_bytes` | Total mapping bytes of direct-mmap allocations, read from `mp_.mmapped_mem`. |
+| `total_system_bytes` | `arena_system_bytes + direct_mmap_bytes`: the total system memory currently managed by glibc malloc. |
+
+These fields are `null` when they cannot be read reliably. They depend on validated DWARF member layouts; an unavailable optional field does not affect the existing heap/chunk analysis.
+
 **Each arena**
 
 | Field | Meaning |
 |---|---|
 | `index` | `0` is the main arena; secondary (per-thread) arenas are `1`, `2`, … |
 | `is_main` | Whether this is the main arena. |
+| `system_mem` | Total bytes currently obtained from the system and managed by this arena; `null` when it cannot be read reliably. |
 | `attached_threads` | Thread IDs currently bound to this arena. |
 | `heaps.count` | Number of heap segments in this arena. |
 | `heaps.total_bytes` | In-use extent of the arena's heaps, in bytes. |
@@ -206,6 +227,12 @@ Conventions: all `bytes` under `allocated`/`free`/`*_histogram` are **payload
 only** (they exclude the chunk header); `overhead.bytes` is the header total. As
 a result `allocated.count + free.count == overhead.count`, and `free.tcache` is
 always present with both arrays (empty when there is no tcache).
+
+`system_mem` includes allocated and free chunks, the top chunk, allocator
+metadata, and fragmentation. Direct-mmap allocations do not belong to an arena;
+a secondary arena heap still belongs to its arena even when it was created with
+`mmap`. `total_system_bytes` is allocator system footprint, not requested bytes
+or RSS/PSS.
 
 ### Problem kinds
 

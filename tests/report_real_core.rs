@@ -56,11 +56,30 @@ fn report_on_real_core_has_valid_schema() {
         json["glibc_capabilities"]["layout_source"].as_str(),
         Some("builtin" | "dwarf")
     ));
+    let malloc = json["glibc_malloc"]
+        .as_object()
+        .expect("glibc_malloc object");
+    for field in [
+        "arena_system_bytes",
+        "direct_mmap_count",
+        "direct_mmap_bytes",
+        "total_system_bytes",
+    ] {
+        assert!(malloc[field].is_null() || malloc[field].is_u64());
+    }
+    if let (Some(arena), Some(mmap), Some(total)) = (
+        malloc["arena_system_bytes"].as_u64(),
+        malloc["direct_mmap_bytes"].as_u64(),
+        malloc["total_system_bytes"].as_u64(),
+    ) {
+        assert_eq!(arena.checked_add(mmap), Some(total));
+    }
 
     let arenas = json["arenas"].as_array().expect("arenas array");
     assert!(!arenas.is_empty(), "expected at least the main arena");
     let main = &arenas[0];
     assert_eq!(main["is_main"], true);
+    assert!(main.get("system_mem").is_some());
 
     // Totals must be self-consistent: overhead counts every walked chunk.
     let alloc = main["allocated"]["count"].as_u64().unwrap();
@@ -102,6 +121,13 @@ fn analyze_core_in_process_is_self_consistent() {
     assert_eq!(report.schema_version, 1);
     let main = &report.arenas[0];
     assert!(main.is_main);
+    if let (Some(arena), Some(mmap), Some(total)) = (
+        report.glibc_malloc.arena_system_bytes,
+        report.glibc_malloc.direct_mmap_bytes,
+        report.glibc_malloc.total_system_bytes,
+    ) {
+        assert_eq!(arena.checked_add(mmap), Some(total));
+    }
     assert_eq!(
         main.allocated.count + main.free.count,
         main.overhead.count,

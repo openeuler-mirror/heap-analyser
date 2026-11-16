@@ -53,10 +53,13 @@ pub(super) struct DwarfLayout {
     pub(super) fastbin_count: u32,
     pub(super) malloc_state_top_offset: u32,
     pub(super) malloc_state_next_offset: u32,
+    pub(super) malloc_state_system_mem_offset: Option<u32>,
 
     pub(super) mp_arena_max_offset: Option<u32>,
     pub(super) mp_sbrk_base_offset: u32,
     pub(super) mp_tcache_bins_offset: Option<u32>,
+    pub(super) mp_n_mmaps_offset: Option<u32>,
+    pub(super) mp_mmapped_mem_offset: Option<u32>,
 
     pub(super) heap_info_size: u32,
     pub(super) heap_info_ar_ptr_offset: u32,
@@ -102,8 +105,14 @@ impl Target {
 
     fn wanted_members(self) -> &'static [&'static str] {
         match self {
-            Target::MallocState => &["fastbinsY", "top", "next"],
-            Target::MallocPar => &["arena_max", "sbrk_base", "tcache_bins"],
+            Target::MallocState => &["fastbinsY", "top", "next", "system_mem"],
+            Target::MallocPar => &[
+                "arena_max",
+                "sbrk_base",
+                "tcache_bins",
+                "n_mmaps",
+                "mmapped_mem",
+            ],
             Target::HeapInfo => &["ar_ptr", "prev", "size", "mprotect_size"],
             Target::Tcache => &["counts", "entries"],
         }
@@ -722,6 +731,33 @@ fn assemble_layout(
     } else {
         None
     };
+    let system_mem = select_scalar_member(
+        index,
+        Target::MallocState,
+        &malloc_state,
+        |structure| validate_malloc_state(structure, word_size),
+        "system_mem",
+        TypeKind::Unsigned,
+        word_size,
+    );
+    let n_mmaps = select_scalar_member(
+        index,
+        Target::MallocPar,
+        &malloc_par,
+        |structure| validate_malloc_par(structure, word_size),
+        "n_mmaps",
+        TypeKind::Signed,
+        4,
+    );
+    let mmapped_mem = select_scalar_member(
+        index,
+        Target::MallocPar,
+        &malloc_par,
+        |structure| validate_malloc_par(structure, word_size),
+        "mmapped_mem",
+        TypeKind::Unsigned,
+        word_size,
+    );
 
     Ok(DwarfLayout {
         malloc_state_size: checked_u32(malloc_state.size, "malloc_state size")?,
@@ -729,6 +765,9 @@ fn assemble_layout(
         fastbin_count: checked_u32(malloc_state.fastbin_count, "fastbin count")?,
         malloc_state_top_offset: checked_u32(malloc_state.top, "top offset")?,
         malloc_state_next_offset: checked_u32(malloc_state.next, "next offset")?,
+        malloc_state_system_mem_offset: system_mem
+            .map(|value| checked_u32(value, "system_mem offset"))
+            .transpose()?,
         mp_arena_max_offset: malloc_par
             .arena_max
             .map(|value| checked_u32(value, "arena_max offset"))
@@ -737,6 +776,12 @@ fn assemble_layout(
         mp_tcache_bins_offset: malloc_par
             .tcache_bins
             .map(|value| checked_u32(value, "tcache_bins offset"))
+            .transpose()?,
+        mp_n_mmaps_offset: n_mmaps
+            .map(|value| checked_u32(value, "n_mmaps offset"))
+            .transpose()?,
+        mp_mmapped_mem_offset: mmapped_mem
+            .map(|value| checked_u32(value, "mmapped_mem offset"))
             .transpose()?,
         heap_info_size: checked_u32(heap_info.size, "heap_info size")?,
         heap_info_ar_ptr_offset: checked_u32(heap_info.ar_ptr, "ar_ptr offset")?,
@@ -793,6 +838,63 @@ where
             target.name()
         ))),
     }
+}
+
+fn select_scalar_member<T: PartialEq, F>(
+    index: &TypeIndex,
+    target: Target,
+    required_layout: &T,
+    validate_required: F,
+    name: &str,
+    kind: TypeKind,
+    width: u64,
+) -> Option<u64>
+where
+    F: Fn(&Structure) -> Result<T, DwarfLayoutError>,
+{
+    let candidates = index.candidates.get(&target)?;
+    let mut selected = None;
+    for structure in candidates {
+        if validate_required(structure).ok().as_ref() != Some(required_layout) {
+            continue;
+        }
+        let member = required_member(structure, name).ok()?;
+        field_range(member, structure.byte_size).ok()?;
+        if member.ty.kind != kind
+            || member.ty.byte_size != Some(width)
+            || member.offset % width != 0
+            || overlaps_another_member(structure, member)
+        {
+            return None;
+        }
+        match selected {
+            Some(offset) if offset != member.offset => return None,
+            Some(_) => {}
+            None => selected = Some(member.offset),
+        }
+    }
+    selected
+}
+
+fn overlaps_another_member(structure: &Structure, member: &Member) -> bool {
+    let Some(size) = member.ty.byte_size else {
+        return true;
+    };
+    let Some(end) = member.offset.checked_add(size) else {
+        return true;
+    };
+    structure.members.iter().any(|other| {
+        if std::ptr::eq(other, member) {
+            return false;
+        }
+        let Some(other_size) = other.ty.byte_size else {
+            return true;
+        };
+        let Some(other_end) = other.offset.checked_add(other_size) else {
+            return true;
+        };
+        member.offset < other_end && other.offset < end
+    })
 }
 
 #[derive(Clone, PartialEq)]
@@ -1237,6 +1339,7 @@ mod tests {
         fastbinsY: [*mut u8; 10],
         top: *mut u8,
         next: *mut malloc_state,
+        system_mem: usize,
     }
 
     #[repr(C)]
@@ -1245,6 +1348,8 @@ mod tests {
         arena_max: usize,
         sbrk_base: *mut u8,
         tcache_bins: usize,
+        n_mmaps: i32,
+        mmapped_mem: usize,
     }
 
     #[repr(C)]
@@ -1270,11 +1375,14 @@ mod tests {
                 fastbinsY: [std::ptr::null_mut(); 10],
                 top: std::ptr::null_mut(),
                 next: std::ptr::null_mut(),
+                system_mem: 0,
             },
             malloc_par {
                 arena_max: 0,
                 sbrk_base: std::ptr::null_mut(),
                 tcache_bins: 64,
+                n_mmaps: 0,
+                mmapped_mem: 0,
             },
             heap_info {
                 ar_ptr: std::ptr::null_mut(),
@@ -1293,6 +1401,9 @@ mod tests {
         let elf = image.parse().unwrap();
         let layout = extract_layout(&elf, true).unwrap();
         assert_eq!(layout.fastbin_count, 10);
+        assert_eq!(layout.malloc_state_system_mem_offset, Some(96));
+        assert_eq!(layout.mp_n_mmaps_offset, Some(24));
+        assert_eq!(layout.mp_mmapped_mem_offset, Some(32));
         assert_eq!(layout.tcache_max_bins, Some(64));
         assert_eq!(layout.tcache_entries_offset, Some(128));
     }
@@ -1348,7 +1459,7 @@ mod tests {
     fn rejects_two_distinct_valid_layouts_for_one_target() {
         let mut index = valid_index(TypeKind::Unsigned, 2, 64);
         let mut alternate = index.candidates[&Target::MallocState][0].clone();
-        alternate.byte_size = 120;
+        alternate.byte_size = 128;
         alternate
             .members
             .iter_mut()
@@ -1361,6 +1472,12 @@ mod tests {
             .find(|member| member.name == "next")
             .unwrap()
             .offset = 112;
+        alternate
+            .members
+            .iter_mut()
+            .find(|member| member.name == "system_mem")
+            .unwrap()
+            .offset = 120;
         index
             .candidates
             .get_mut(&Target::MallocState)
@@ -1380,6 +1497,38 @@ mod tests {
         let layout = assemble_layout(&index, 8, false).unwrap();
         assert_eq!(layout.tcache_entries_offset, None);
         assert_eq!(layout.tcache_max_bins, None);
+    }
+
+    #[test]
+    fn missing_footprint_members_do_not_reject_the_heap_layout() {
+        let mut index = valid_index(TypeKind::Unsigned, 2, 64);
+        index.candidates.get_mut(&Target::MallocState).unwrap()[0]
+            .members
+            .retain(|member| member.name != "system_mem");
+        index.candidates.get_mut(&Target::MallocPar).unwrap()[0]
+            .members
+            .retain(|member| !matches!(member.name.as_str(), "n_mmaps" | "mmapped_mem"));
+
+        let layout = assemble_layout(&index, 8, true).unwrap();
+        assert_eq!(layout.malloc_state_system_mem_offset, None);
+        assert_eq!(layout.mp_n_mmaps_offset, None);
+        assert_eq!(layout.mp_mmapped_mem_offset, None);
+    }
+
+    #[test]
+    fn invalid_mmap_count_does_not_hide_other_footprint_offsets() {
+        let mut index = valid_index(TypeKind::Unsigned, 2, 64);
+        index.candidates.get_mut(&Target::MallocPar).unwrap()[0]
+            .members
+            .iter_mut()
+            .find(|member| member.name == "n_mmaps")
+            .unwrap()
+            .ty = scalar_type(TypeKind::Unsigned, 4);
+
+        let layout = assemble_layout(&index, 8, true).unwrap();
+        assert_eq!(layout.mp_n_mmaps_offset, None);
+        assert_eq!(layout.mp_mmapped_mem_offset, Some(32));
+        assert_eq!(layout.malloc_state_system_mem_offset, Some(112));
     }
 
     #[test]
@@ -1428,22 +1577,25 @@ mod tests {
         index.candidates.insert(
             Target::MallocState,
             vec![Structure {
-                byte_size: 112,
+                byte_size: 120,
                 members: vec![
                     member("fastbinsY", 16, array_type(TypeKind::Pointer, 8, 10)),
                     member("top", 96, scalar_type(TypeKind::Pointer, 8)),
                     member("next", 104, scalar_type(TypeKind::Pointer, 8)),
+                    member("system_mem", 112, scalar_type(TypeKind::Unsigned, 8)),
                 ],
             }],
         );
         index.candidates.insert(
             Target::MallocPar,
             vec![Structure {
-                byte_size: 24,
+                byte_size: 40,
                 members: vec![
                     member("arena_max", 0, scalar_type(TypeKind::Unsigned, 8)),
                     member("sbrk_base", 8, scalar_type(TypeKind::Pointer, 8)),
                     member("tcache_bins", 16, scalar_type(TypeKind::Unsigned, 8)),
+                    member("n_mmaps", 24, scalar_type(TypeKind::Signed, 4)),
+                    member("mmapped_mem", 32, scalar_type(TypeKind::Unsigned, 8)),
                 ],
             }],
         );

@@ -14,6 +14,7 @@
 //! TLS relocation, and version-derived capabilities needed by the analysis.
 
 mod dwarf;
+pub(crate) mod footprint;
 mod heap_info;
 mod malloc_state;
 mod tcache;
@@ -91,10 +92,13 @@ pub struct DetectedLayout {
     pub fastbin_count: u32,
     pub malloc_state_top_offset: u32,
     pub malloc_state_next_offset: u32,
+    pub(crate) malloc_state_system_mem_offset: Option<u32>,
 
     pub mp_arena_max_offset: u32,
     pub mp_sbrk_base_offset: u32,
     pub mp_tcache_bins_offset: u32,
+    pub(crate) mp_n_mmaps_offset: Option<u32>,
+    pub(crate) mp_mmapped_mem_offset: Option<u32>,
 
     pub heap_info_size: u32,
     pub heap_info_ar_ptr_offset: u32,
@@ -200,9 +204,12 @@ impl DetectedLayout {
             fastbin_count: ms.fastbin_count,
             malloc_state_top_offset: ms.top,
             malloc_state_next_offset: ms.next,
+            malloc_state_system_mem_offset: None,
             mp_arena_max_offset: 4 * word_size,
             mp_sbrk_base_offset,
             mp_tcache_bins_offset: mp_sbrk_base_offset + word_size,
+            mp_n_mmaps_offset: None,
+            mp_mmapped_mem_offset: None,
             heap_info_size: hi.sizeof,
             heap_info_ar_ptr_offset: hi.ar_ptr,
             heap_info_prev_offset: hi.prev,
@@ -243,6 +250,7 @@ impl DetectedLayout {
         self.fastbin_count = layout.fastbin_count;
         self.malloc_state_top_offset = layout.malloc_state_top_offset;
         self.malloc_state_next_offset = layout.malloc_state_next_offset;
+        self.malloc_state_system_mem_offset = layout.malloc_state_system_mem_offset;
         self.mp_sbrk_base_offset = layout.mp_sbrk_base_offset;
         if let Some(offset) = layout.mp_arena_max_offset {
             self.mp_arena_max_offset = offset;
@@ -250,6 +258,8 @@ impl DetectedLayout {
         if let Some(offset) = layout.mp_tcache_bins_offset {
             self.mp_tcache_bins_offset = offset;
         }
+        self.mp_n_mmaps_offset = layout.mp_n_mmaps_offset;
+        self.mp_mmapped_mem_offset = layout.mp_mmapped_mem_offset;
         self.heap_info_size = layout.heap_info_size;
         self.heap_info_ar_ptr_offset = layout.heap_info_ar_ptr_offset;
         self.heap_info_prev_offset = layout.heap_info_prev_offset;
@@ -436,9 +446,12 @@ pub(crate) fn test_layout(word_size: u32) -> DetectedLayout {
         fastbin_count: ms.fastbin_count,
         malloc_state_top_offset: ms.top,
         malloc_state_next_offset: ms.next,
+        malloc_state_system_mem_offset: None,
         mp_arena_max_offset: 4 * word_size,
         mp_sbrk_base_offset,
         mp_tcache_bins_offset: mp_sbrk_base_offset + word_size,
+        mp_n_mmaps_offset: None,
+        mp_mmapped_mem_offset: None,
         heap_info_size: hi.sizeof,
         heap_info_ar_ptr_offset: hi.ar_ptr,
         heap_info_prev_offset: hi.prev,

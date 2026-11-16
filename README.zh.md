@@ -3,9 +3,10 @@
 [English](README.md) | [中文](README.zh.md)
 
 分析 ELF core dump 中的 glibc `malloc` 堆，输出一份机器可读的 JSON 报告：按 arena 汇总的
-已分配/空闲统计、尺寸直方图，以及 fastbin 和 tcache 空闲链表的内容。
+已分配/空闲统计、尺寸直方图、fastbin 和 tcache 空闲链表，以及 glibc malloc 当前管理的
+arena/direct-mmap 系统空间。
 
-它从 core 里读取 glibc 的内部结构（`malloc_state`、`_heap_info`、
+它从 core 里读取 glibc 的内部结构（`malloc_state`、`malloc_par`、`_heap_info`、
 `tcache_perthread_struct`），因此需要一个**带符号的参考 libc** 来确定这些结构及其字段的位置。
 
 当前验证范围：x86-64 Linux core，glibc 2.38。
@@ -100,11 +101,18 @@ heap-analyser report core.1234 --libc libc.so.6.full
     "has_safe_linking": true,
     "version_source": "gnu_version_d"
   },
+  "glibc_malloc": {
+    "arena_system_bytes": 8192,
+    "direct_mmap_count": 0,
+    "direct_mmap_bytes": 0,
+    "total_system_bytes": 8192
+  },
   "problems": [],
   "arenas": [
     {
       "index": 0,
       "is_main": true,
+      "system_mem": 8192,
       "attached_threads": [1234],
       "heaps": { "count": 1, "total_bytes": 7248, "committed_bytes": 7248 },
       "allocated": {
@@ -156,6 +164,7 @@ heap-analyser report core.1234 --libc libc.so.6.full
 | `core_path` | 被分析的 core dump 路径。 |
 | `libc` | 使用了哪个参考 libc，以及是如何匹配上的。 |
 | `glibc_capabilities` | 从参考 libc 探测到的 glibc 能力。 |
+| `glibc_malloc` | glibc malloc 当前管理的 arena、direct-mmap 及总系统空间。 |
 | `problems` | 可恢复的问题（见*Problem 类型*）；`[]` 表示一次干净的分析。 |
 | `arenas` | 按 arena 的结果，`index` 0 在前。 |
 
@@ -177,12 +186,24 @@ heap-analyser report core.1234 --libc libc.so.6.full
 | `has_safe_linking` | 空闲链表指针混淆生效（glibc ≥ 2.32）；决定是否对 fastbin/tcache 指针做反混淆。 |
 | `version_source` | `gnu_version_d`（版本读自 libc 的 `.gnu.version_d`）或 `assumed_default`（探测失败，默认按启用 safe-linking 处理）。 |
 
+**`glibc_malloc`**
+
+| 字段 | 含义 |
+|---|---|
+| `arena_system_bytes` | 所有 `arenas[].system_mem` 之和。仅在 arena ring 完整且每个值均可读取时有效。 |
+| `direct_mmap_count` | glibc 当前存活的 direct-mmap allocation 数量，来自 `mp_.n_mmaps`。 |
+| `direct_mmap_bytes` | direct-mmap allocation 的映射总字节数，来自 `mp_.mmapped_mem`。 |
+| `total_system_bytes` | `arena_system_bytes + direct_mmap_bytes`，即 glibc malloc 当前管理的系统空间总量。 |
+
+以上字段无法可靠读取时为 `null`。它们依赖通过校验的 DWARF 字段布局；某个可选字段不可用不会影响原有 heap/chunk 分析。
+
 **每个 arena**
 
 | 字段 | 含义 |
 |---|---|
 | `index` | `0` 为 main arena；secondary（每线程）arena 为 `1`、`2`、…… |
 | `is_main` | 是否为 main arena。 |
+| `system_mem` | 该 arena 当前从系统取得且仍由 malloc 管理的总字节数；无法可靠读取时为 `null`。 |
 | `attached_threads` | 当前挂靠到该 arena 的线程 ID。 |
 | `heaps.count` | 该 arena 的 heap 段数量。 |
 | `heaps.total_bytes` | 该 arena 各 heap 的在用字节数之和。 |
@@ -199,6 +220,10 @@ heap-analyser report core.1234 --libc libc.so.6.full
 约定：`allocated`/`free`/`*_histogram` 下的所有 `bytes` 都是 **payload 口径**（不含 chunk
 头）；`overhead.bytes` 才是头部总量。因此 `allocated.count + free.count == overhead.count`；
 `free.tcache` 恒定存在且两个数组都在（没有 tcache 时为空）。
+
+`system_mem` 包含 allocated/free chunk、top chunk、元数据和碎片。direct-mmap allocation 不属于任何
+arena；secondary arena 的 heap 即使由 `mmap` 创建，仍计入对应 arena 的 `system_mem`。
+`total_system_bytes` 是 allocator system footprint，不是用户请求量，也不是 RSS/PSS。
 
 ### Problem 类型
 
