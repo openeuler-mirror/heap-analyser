@@ -82,7 +82,16 @@ fn list_main(
     }
 
     let mut problems = Vec::new();
-    let last_address = top.wrapping_add(word);
+    let last_address = match top.checked_add(word) {
+        Some(end) => end,
+        None => {
+            problems.push(Problem::HeapWalkTruncated {
+                arena: arena.index,
+                reason: "top address overflows its region".to_string(),
+            });
+            return Ok((Vec::new(), problems));
+        }
+    };
 
     // Normally sbrk_base is the heap start. On aarch64 the main arena can be
     // mmap-backed and sbrk_base points elsewhere; fall back to the start of the
@@ -116,7 +125,7 @@ fn list_main(
                 arena: arena.index,
                 reason: "top is below heap start".to_string(),
             });
-            0
+            return Ok((Vec::new(), problems));
         }
     };
 
@@ -188,7 +197,16 @@ fn list_secondary(
         // overflow means the size is garbage.
         let is_top_heap = current == top_heap;
         let region_end = if is_top_heap {
-            top.wrapping_add(word)
+            match top.checked_add(word) {
+                Some(end) => end,
+                None => {
+                    problems.push(Problem::HeapWalkTruncated {
+                        arena: arena.index,
+                        reason: "top address overflows its region".to_string(),
+                    });
+                    break;
+                }
+            }
         } else {
             match current.checked_add(info.size) {
                 Some(end) => end,
@@ -308,6 +326,51 @@ mod tests {
     }
 
     #[test]
+    fn main_arena_top_address_overflow_is_flagged() {
+        let layout = test_layout(8);
+        let arena = Arena {
+            malloc_state_addr: LIBC,
+            index: 0,
+        };
+        let mut mem = FakeMem::new();
+        mem.add_segment(0x40000, 0x41000);
+        mem.set(LIBC + u64::from(layout.mp_sbrk_base_offset), 0x40000);
+        mem.set(
+            LIBC + u64::from(layout.malloc_state_top_offset),
+            u64::MAX - 7,
+        );
+
+        let (heaps, problems) = list(&mem, &layout, LIBC, &arena).unwrap();
+        assert!(heaps.is_empty());
+        assert!(matches!(
+            problems.as_slice(),
+            [Problem::HeapWalkTruncated { arena: 0, reason }]
+                if reason == "top address overflows its region"
+        ));
+    }
+
+    #[test]
+    fn main_arena_inverted_region_is_rejected() {
+        let layout = test_layout(8);
+        let arena = Arena {
+            malloc_state_addr: LIBC,
+            index: 0,
+        };
+        let mut mem = FakeMem::new();
+        mem.add_segment(0x40000, 0x41000);
+        mem.set(LIBC + u64::from(layout.mp_sbrk_base_offset), 0x40000);
+        mem.set(LIBC + u64::from(layout.malloc_state_top_offset), 0x3ff00);
+
+        let (heaps, problems) = list(&mem, &layout, LIBC, &arena).unwrap();
+        assert!(heaps.is_empty());
+        assert!(matches!(
+            problems.as_slice(),
+            [Problem::HeapWalkTruncated { arena: 0, reason }]
+                if reason == "top is below heap start"
+        ));
+    }
+
+    #[test]
     fn secondary_single_heap_skips_embedded_malloc_state() {
         let mut layout = test_layout(8);
         layout.main_arena.size = 0x8b0; // sizeof(malloc_state) on 64-bit-ish
@@ -340,6 +403,33 @@ mod tests {
             "region_start must skip _heap_info + embedded malloc_state"
         );
         assert_eq!(heaps[0].region_end, top + 8);
+    }
+
+    #[test]
+    fn secondary_top_address_overflow_is_flagged() {
+        let layout = test_layout(8);
+        let top = u64::MAX - 7;
+        let heap_addr = top & !(layout.heap_max_size - 1);
+        let arena = Arena {
+            malloc_state_addr: 0x9000,
+            index: 1,
+        };
+        let mut mem = FakeMem::new();
+        mem.set(0x9000 + u64::from(layout.malloc_state_top_offset), top);
+        mem.set(heap_addr + u64::from(layout.heap_info_size_offset), 0x2000);
+        mem.set(
+            heap_addr + u64::from(layout.heap_info_mprotect_size_offset),
+            0x2000,
+        );
+        mem.set(heap_addr + u64::from(layout.heap_info_prev_offset), 0);
+
+        let (heaps, problems) = list(&mem, &layout, LIBC, &arena).unwrap();
+        assert!(heaps.is_empty());
+        assert!(matches!(
+            problems.as_slice(),
+            [Problem::HeapWalkTruncated { arena: 1, reason }]
+                if reason == "top address overflows its region"
+        ));
     }
 
     #[test]
