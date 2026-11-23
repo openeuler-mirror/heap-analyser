@@ -24,7 +24,8 @@ use crate::problem::Problem;
 
 use super::fastbin::{fastbin_index_to_size, reveal};
 
-const MAX_CHAIN: usize = 10_000;
+// Maximum configurable per-bin tcache count in glibc 2.38.
+const MAX_CHAIN: usize = u16::MAX as usize;
 
 pub fn tcache_index_to_size(layout: &DetectedLayout, i: u32) -> u64 {
     fastbin_index_to_size(layout, i)
@@ -106,10 +107,18 @@ pub fn walk_tcache_bin(
     let mut cur = head;
 
     loop {
-        if !visited.insert(cur) || visited.len() > MAX_CHAIN {
+        if !visited.insert(cur) {
             problems.push(Problem::TcacheCycleDetected {
                 thread_id,
                 bin_index,
+            });
+            break;
+        }
+        if visited.len() > MAX_CHAIN {
+            problems.push(Problem::TcacheLimitExceeded {
+                thread_id,
+                bin_index,
+                limit: MAX_CHAIN,
             });
             break;
         }
@@ -155,6 +164,36 @@ mod tests {
         let (result, problems) = walk_tcache_bin(&mem, &layout, e0, 7, 0);
         assert!(problems.is_empty());
         assert_eq!(result.user_addrs, vec![e0, e1, e2]);
+    }
+
+    #[test]
+    fn distinguishes_chain_end_cycle_and_limit_at_the_last_entry() {
+        let mut layout = test_layout(8);
+        layout.capabilities.has_safe_linking = false;
+        let head = 0x1010;
+        let last = head + (MAX_CHAIN as u64 - 1) * 32;
+        let mut mem = FakeMem::new();
+        for entry in (head..last).step_by(32) {
+            mem.set(entry, entry + 32);
+        }
+        mem.set(last + 32, 0);
+
+        let cycle = Problem::TcacheCycleDetected {
+            thread_id: 7,
+            bin_index: 0,
+        };
+        let limit = Problem::TcacheLimitExceeded {
+            thread_id: 7,
+            bin_index: 0,
+            limit: 65_535,
+        };
+        for (tail, expected) in [(0, vec![]), (head, vec![cycle]), (last + 32, vec![limit])] {
+            mem.set(last, tail);
+            let (result, problems) = walk_tcache_bin(&mem, &layout, head, 7, 0);
+            assert_eq!(result.user_addrs.len(), 65_535);
+            assert_eq!(result.user_addrs.last(), Some(&last));
+            assert_eq!(problems, expected);
+        }
     }
 
     #[test]

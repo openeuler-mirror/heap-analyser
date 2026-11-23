@@ -21,7 +21,7 @@ use crate::elf::MemReader;
 use crate::glibc::DetectedLayout;
 use crate::problem::Problem;
 
-use super::chunk::{chunk_size, NON_MAIN_ARENA, PREV_INUSE};
+use super::chunk::{chunk_size, PREV_INUSE};
 
 /// Extra safety cap on chunks per region, independent of the region bound.
 const MAX_CHUNKS: u64 = 10_000_000;
@@ -45,9 +45,7 @@ pub struct ChunkEvent {
 /// size-field address and `region_end` is one word past the last usable chunk
 /// (`top + word` for the last heap of an arena).
 ///
-/// Returns partial results with a `Problem` on any corruption rather than
-/// aborting — a damaged chunk shouldn't cost us the chunks before it. The
-/// sentinel check applies only to non-main arenas; see the flag logic below.
+/// Returns partial results with a `Problem` if the walk cannot continue.
 pub fn walk_region(
     mem: &impl MemReader,
     layout: &DetectedLayout,
@@ -152,20 +150,31 @@ pub fn walk_region(
             }
         };
 
-        // Sentinel: a non-main-arena chunk that has lost its NON_MAIN_ARENA flag
-        // is the fake top bridging to the next heap. If the next chunk's end plus
-        // one word hits region_end and that word is a bare PREV_INUSE, this is
-        // the end of an intermediate heap — stop without counting this bridge.
-        // The last heap's real chunks keep the flag, so this never fires there.
-        if !is_main_arena && current_header & NON_MAIN_ARENA == 0 {
-            let next_size = chunk_size(next_header);
-            if let Some(sentinel_addr) = next_cursor.checked_add(next_size) {
-                if sentinel_addr.checked_add(word) == Some(region_end)
-                    && mem.read_u64(sentinel_addr).ok() == Some(PREV_INUSE)
-                {
-                    break;
-                }
-            }
+        // sysmalloc ends a non-contiguous main-arena region with two header-sized
+        // fenceposts. Freeing the preceding chunk can clear the first PREV_INUSE.
+        if is_main_arena && full_size == 2 * word {
+            let reason = if current_header & !PREV_INUSE == full_size
+                && next_header == (full_size | PREV_INUSE)
+                && next_cursor < region_end
+            {
+                "non-contiguous main arena; later chunks not scanned"
+            } else {
+                "chunk size below minimum"
+            };
+            problems.push(Problem::HeapWalkTruncated {
+                arena: arena_index,
+                reason: reason.to_string(),
+            });
+            break;
+        }
+
+        // Only the fencepost itself is followed by the zero-size end marker.
+        // A real free chunk before it can also have NON_MAIN_ARENA cleared.
+        if !is_main_arena
+            && next_header == PREV_INUSE
+            && next_cursor.checked_add(word) == Some(region_end)
+        {
+            break;
         }
 
         events.push(ChunkEvent {
@@ -208,6 +217,76 @@ mod tests {
         assert!(events[0].prev_inuse_says_in_use);
         assert!(!events[1].prev_inuse_says_in_use);
         assert!(events[2].prev_inuse_says_in_use);
+    }
+
+    #[test]
+    fn stops_at_main_arena_double_fencepost() {
+        let layout = test_layout(8);
+        for prev_inuse in [0, PREV_INUSE] {
+            let mut mem = FakeMem::new();
+            mem.set(0x108, 0x41)
+                .set(0x148, 0x10 | prev_inuse)
+                .set(0x158, 0x11);
+            let (events, problems) = walk_region(&mem, &layout, 0, 0x108, 0x208, true);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].user_size, 56);
+            assert_eq!(events[0].prev_inuse_says_in_use, prev_inuse != 0);
+            assert!(
+                matches!(problems.as_slice(), [Problem::HeapWalkTruncated { arena: 0, reason }]
+                if reason.contains("non-contiguous main arena"))
+            );
+        }
+    }
+
+    #[test]
+    fn lone_short_chunk_is_not_a_main_arena_fencepost_pair() {
+        let layout = test_layout(8);
+        let mut mem = FakeMem::new();
+        for (first, second, end) in [
+            (0x11, 0x21, 0x208),
+            (0x13, 0x11, 0x208),
+            (0x11, 0x11, 0x118),
+        ] {
+            mem.set(0x108, first).set(0x118, second);
+            let (events, problems) = walk_region(&mem, &layout, 0, 0x108, end, true);
+            assert!(events.is_empty());
+            assert!(
+                matches!(problems.as_slice(), [Problem::HeapWalkTruncated { reason, .. }]
+                if reason == "chunk size below minimum")
+            );
+        }
+    }
+
+    #[test]
+    fn counts_the_chunk_before_an_intermediate_heap_fencepost() {
+        use crate::heap::chunk::NON_MAIN_ARENA;
+        let layout = test_layout(8);
+        for (flags, fencepost, in_use) in [(0, 0x10, false), (NON_MAIN_ARENA, 0x11, true)] {
+            let mut mem = FakeMem::new();
+            mem.set(0x108, 0x1001 | flags)
+                .set(0x1108, fencepost)
+                .set(0x1118, PREV_INUSE);
+            let (events, problems) = walk_region(&mem, &layout, 1, 0x108, 0x1120, false);
+            assert!(problems.is_empty(), "{problems:?}");
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].user_size, 4088);
+            assert_eq!(events[0].prev_inuse_says_in_use, in_use);
+        }
+    }
+
+    #[test]
+    fn skips_a_lone_fencepost_but_counts_the_last_chunk_before_top() {
+        let layout = test_layout(8);
+        let mut mem = FakeMem::new();
+        mem.set(0x108, 0x21).set(0x128, PREV_INUSE);
+        let (events, problems) = walk_region(&mem, &layout, 1, 0x108, 0x130, false);
+        assert!(problems.is_empty() && events.is_empty());
+
+        mem.set(0x128, 0x1001); // current heap: region_end is the top's size field
+        let (events, problems) = walk_region(&mem, &layout, 1, 0x108, 0x128, false);
+        assert!(problems.is_empty());
+        assert_eq!(events.len(), 1);
+        assert!(events[0].prev_inuse_says_in_use);
     }
 
     #[test]

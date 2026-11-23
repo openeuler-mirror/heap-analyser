@@ -23,7 +23,7 @@ use crate::glibc::DetectedLayout;
 use crate::problem::Problem;
 
 /// Defensive ceiling; the cycle check below normally ends the walk first.
-const MAX_ARENAS: u32 = 1024;
+const MAX_ARENAS: u32 = 4_096;
 
 pub struct Arena {
     pub malloc_state_addr: u64,
@@ -64,13 +64,6 @@ pub fn list(
     let mut index = 1u32;
 
     loop {
-        if index >= MAX_ARENAS {
-            problems.push(Problem::HeapWalkTruncated {
-                arena: index,
-                reason: "arena list did not cycle back within limit".to_string(),
-            });
-            break;
-        }
         let next = match mem.read_u64(current.wrapping_add(next_off)) {
             Ok(n) => n,
             Err(_) => {
@@ -92,6 +85,10 @@ pub fn list(
                 arena: index,
                 reason: "arena next pointer forms a mid-chain cycle".to_string(),
             });
+            break;
+        }
+        if index >= MAX_ARENAS {
+            problems.push(Problem::ArenaLimitExceeded { limit: MAX_ARENAS });
             break;
         }
         // Verify the candidate is itself readable before trusting it as an arena.
@@ -172,6 +169,38 @@ mod tests {
             problems.as_slice(),
             [Problem::HeapWalkTruncated { reason, .. }] if reason.contains("cycle")
         ));
+    }
+
+    #[test]
+    fn distinguishes_ring_closure_cycle_and_limit_at_the_last_arena() {
+        let layout = test_layout(8);
+        let next_off = u64::from(layout.malloc_state_next_offset);
+        let step = 0x1000;
+        let last = LIBC + u64::from(MAX_ARENAS - 1) * step;
+        let mut mem = FakeMem::new();
+        with_top(&mut mem, &layout, LIBC);
+        for i in 0..MAX_ARENAS - 1 {
+            let arena = LIBC + u64::from(i) * step;
+            mem.set(arena + next_off, arena + step);
+        }
+        mem.set(last + step + next_off, LIBC);
+
+        mem.set(last + next_off, LIBC);
+        let (arenas, problems) = list(&mem, &layout, LIBC).unwrap();
+        assert_eq!(arenas.len(), 4_096);
+        assert!(problems.is_empty());
+
+        mem.set(last + next_off, last);
+        let (_, problems) = list(&mem, &layout, LIBC).unwrap();
+        assert!(matches!(
+            problems.as_slice(),
+            [Problem::HeapWalkTruncated { reason, .. }] if reason.contains("cycle")
+        ));
+
+        mem.set(last + next_off, last + step);
+        let (arenas, problems) = list(&mem, &layout, LIBC).unwrap();
+        assert_eq!(arenas.len(), 4_096);
+        assert_eq!(problems, [Problem::ArenaLimitExceeded { limit: 4_096 }]);
     }
 
     #[test]

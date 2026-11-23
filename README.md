@@ -210,7 +210,7 @@ These fields are `null` when they cannot be read reliably. They depend on valida
 | `index` | `0` is the main arena; secondary (per-thread) arenas are `1`, `2`, … |
 | `is_main` | Whether this is the main arena. |
 | `system_mem` | Total bytes currently obtained from the system and managed by this arena; `null` when it cannot be read reliably. |
-| `attached_threads` | Thread IDs currently bound to this arena. |
+| `attached_threads` | Thread IDs currently bound to this arena. A thread with a null `thread_arena` is not listed under any arena. |
 | `heaps.count` | Number of heap segments in this arena. |
 | `heaps.total_bytes` | In-use extent of the arena's heaps, in bytes. |
 | `heaps.committed_bytes` | Bytes actually committed (`mprotect`ed); equals `total_bytes` for the main arena. |
@@ -237,7 +237,7 @@ or RSS/PSS.
 ### Problem kinds
 
 Each entry in `problems` is an object with a `kind` field plus context fields
-(`arena`, `thread_id`, `bin_index`, `address`, `size`, `reason`, `symbol`,
+(`arena`, `thread_id`, `bin_index`, `address`, `size`, `limit`, `reason`, `symbol`,
 `machine` — whichever apply). New non-fatal kinds may be added; consumers should
 ignore kinds they do not recognise. The current kinds are:
 
@@ -249,14 +249,17 @@ ignore kinds they do not recognise. The current kinds are:
 | `missing_relocation` | The TP-offset relocation is absent; tcache / `thread_arena` data can't be read. | no |
 | `missing_build_id` | The reference libc has no build-id; identity fell back to a content hash. | no |
 | `unknown_glibc_version` | Version detection failed; safe-linking was assumed on. | no |
-| `dwarf_layout_fallback` | DWARF layout extraction failed; the built-in layout was retained. | no |
-| `fastbin_cycle_detected` | A fastbin chain looped or hit the traversal cap. | no |
+| `dwarf_layout_fallback` | DWARF layout is missing or unusable. If libc differs from the built-in layout, arena, heap and free chunk statistics may be inaccurate. | no |
+| `fastbin_cycle_detected` | A fastbin chain revisited a chunk. | no |
+| `fastbin_limit_exceeded` | More than 1,000,000 chunks in one fastbin; only the first 1,000,000 are counted. | no |
 | `fastbin_chunk_read_failed` | A fastbin head/node read failed; the bin count is partial. | no |
-| `tcache_cycle_detected` | A tcache chain looped or hit the traversal cap. | no |
+| `tcache_cycle_detected` | A tcache chain revisited an entry. | no |
+| `tcache_limit_exceeded` | More than 65,535 entries in one thread's tcache bin; only the first 65,535 are counted. | no |
 | `tcache_chunk_read_failed` | A tcache head/node read failed; the bin is partial. | no |
 | `duplicate_tcache_entry` | The same chunk appears in two tcache bins/threads (a double-free indicator). | no |
 | `chunk_read_failed` | A chunk address was not backed by file content in the core. | no |
-| `heap_walk_truncated` | A heap/list walk stopped early (corruption, out-of-region, or a cap); result is partial. | no |
+| `arena_limit_exceeded` | The arena ring continued beyond 4,096 arenas; the arena list is partial. | no |
+| `heap_walk_truncated` | A heap/list walk stopped early (corruption, out-of-region, or a cap); result is partial. At a double fencepost in the main arena, later regions are not scanned for chunks. | no |
 | `stats_inconsistent` | A size bucket's fastbin count exceeded its allocated count (usually a truncated walk). | no |
 | `thread_tls_resolution_failed` | A thread's TLS couldn't be resolved; its tcache / arena binding is missing. | no |
 
@@ -264,10 +267,16 @@ A *fatal* problem means the analysis is untrustworthy: `report` exits non-zero
 and `check` reports `supported: false`. Non-fatal problems leave a usable report
 that simply flags the degraded parts.
 
+If a fastbin or tcache bin exceeds its limit, some free chunks may still be
+counted as allocated. If the arena list exceeds its limit, `arena_system_bytes`
+and `total_system_bytes` are `null`.
+
 Exit codes: `0` on success (including "recovered with non-fatal problems"),
 non-zero on a hard failure (bad core, libc not located, required symbol missing).
 Hard-failure messages go to stderr; stdout is either a complete JSON document or
 empty.
+
+`report` rejects cores whose `NT_FILE` note declares more than 100,000 file mappings.
 
 ## Development
 

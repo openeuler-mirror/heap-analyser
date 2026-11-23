@@ -23,7 +23,7 @@ use crate::glibc::DetectedLayout;
 use crate::problem::Problem;
 
 /// Traversal cap; the visited set already bounds cyclic chains.
-const MAX_CHAIN: usize = 10_000;
+const MAX_CHAIN: usize = 1_000_000;
 
 /// Nominal payload size of chunks in fastbin `i`.
 pub fn fastbin_index_to_size(layout: &DetectedLayout, i: u32) -> u64 {
@@ -60,10 +60,18 @@ pub fn walk_fastbin(
     let mut current = head;
 
     loop {
-        if !visited.insert(current) || visited.len() > MAX_CHAIN {
+        if !visited.insert(current) {
             problems.push(Problem::FastbinCycleDetected {
                 arena: arena_index,
                 bin_index,
+            });
+            break;
+        }
+        if visited.len() > MAX_CHAIN {
+            problems.push(Problem::FastbinLimitExceeded {
+                arena: arena_index,
+                bin_index,
+                limit: MAX_CHAIN,
             });
             break;
         }
@@ -164,6 +172,36 @@ mod tests {
                 bin_index: 2
             }]
         ));
+    }
+
+    #[test]
+    fn distinguishes_chain_end_cycle_and_limit_at_the_last_chunk() {
+        let mut layout = test_layout(8);
+        layout.capabilities.has_safe_linking = false;
+        let head = 0x1000;
+        let last = head + (MAX_CHAIN as u64 - 1) * 32;
+        let fd = 16;
+        let mut mem = FakeMem::new();
+        for chunk in (head..last).step_by(32) {
+            mem.set(chunk + fd, chunk + 32);
+        }
+        mem.set(last + 32 + fd, 0);
+
+        let cycle = Problem::FastbinCycleDetected {
+            arena: 3,
+            bin_index: 0,
+        };
+        let limit = Problem::FastbinLimitExceeded {
+            arena: 3,
+            bin_index: 0,
+            limit: 1_000_000,
+        };
+        for (tail, expected) in [(0, vec![]), (head, vec![cycle]), (last + 32, vec![limit])] {
+            mem.set(last + fd, tail);
+            let (result, problems) = walk_fastbin(&mem, &layout, head, 3, 0);
+            assert_eq!(result.count, 1_000_000);
+            assert_eq!(problems, expected);
+        }
     }
 
     #[test]
