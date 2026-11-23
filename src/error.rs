@@ -38,6 +38,9 @@ pub enum Error {
     #[error("note data too short: expected at least {expected} bytes, got {actual}")]
     NoteTooShort { expected: usize, actual: usize },
 
+    #[error("NT_FILE declares {count} file mappings; the supported limit is {limit}")]
+    TooManyFileMappings { count: u64, limit: u64 },
+
     #[error("could not locate libc in the core dump: {0}")]
     LibcNotFound(String),
 

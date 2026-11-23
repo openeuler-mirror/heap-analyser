@@ -204,14 +204,14 @@ heap-analyser report core.1234 --libc libc.so.6.full
 | `index` | `0` 为 main arena；secondary（每线程）arena 为 `1`、`2`、…… |
 | `is_main` | 是否为 main arena。 |
 | `system_mem` | 该 arena 当前从系统取得且仍由 malloc 管理的总字节数；无法可靠读取时为 `null`。 |
-| `attached_threads` | 当前挂靠到该 arena 的线程 ID。 |
+| `attached_threads` | 当前绑定到该 arena 的线程 ID。`thread_arena` 为空的线程不列入任何 arena。 |
 | `heaps.count` | 该 arena 的 heap 段数量。 |
 | `heaps.total_bytes` | 该 arena 各 heap 的在用字节数之和。 |
 | `heaps.committed_bytes` | 实际提交（`mprotect`）的字节数；main arena 下等于 `total_bytes`。 |
 | `allocated.count` / `.bytes` | 在用 chunk 数及其 **payload** 字节（payload = chunk 大小 − 一个 word 的头）。 |
 | `allocated.size_histogram[]` | 桶 `{ size, count, bytes = size × count }`，按 payload 尺寸升序。 |
 | `free.count` / `.bytes` | 空闲 chunk 数及 payload 字节，涵盖全部三个来源：tcache、fastbin，以及普通空闲 chunk（unsorted/small/large bin 与已合并的空闲空间）。 |
-| `free.fastbins[]` | 每个 fastbin `{ index, size, count, bytes }`（`size` 为 payload）；只列非空 bin。 |
+| `free.fastbins[]` | 每个 fastbin 的 `{ index, size, count, bytes }`（`size` 为 payload）；只统计堆遍历实际扫到的块，不列空 bin。 |
 | `free.tcache.tcache_threads` | 拥有此处所计 tcache 条目的线程 ID。 |
 | `free.tcache.bins[]` | 每个 tcache bin `{ index, size, count, bytes }`；只列非空 bin。 |
 | `free.size_histogram[]` | 覆盖**全部**空闲 chunk 的 payload 尺寸桶——三个来源合并统计。它**不等于** `fastbins` + `tcache`：普通空闲 chunk 在这里没有单独的数组，因此该直方图可能出现既不在 `fastbins[]`、也不在 `tcache.bins[]` 里的尺寸（如上例中的 312 字节桶）。 |
@@ -228,7 +228,7 @@ arena；secondary arena 的 heap 即使由 `mmap` 创建，仍计入对应 arena
 ### Problem 类型
 
 `problems` 中的每一项都是一个带 `kind` 字段的对象，外加相应的上下文字段（`arena`、
-`thread_id`、`bin_index`、`address`、`size`、`reason`、`symbol`、`machine`——按适用情况）。
+`thread_id`、`bin_index`、`address`、`size`、`limit`、`reason`、`symbol`、`machine`——按适用情况）。
 后续可能增加新的非致命类型，消费者应忽略无法识别的类型。当前类型如下：
 
 | `kind` | 含义 | 致命? |
@@ -239,22 +239,30 @@ arena；secondary arena 的 heap 即使由 `mmap` 创建，仍计入对应 arena
 | `missing_relocation` | 缺少 TP-offset relocation；无法读取 tcache / `thread_arena` 数据。 | 否 |
 | `missing_build_id` | 参考 libc 无 build-id；身份退化为内容哈希。 | 否 |
 | `unknown_glibc_version` | 版本探测失败；默认按启用 safe-linking 处理。 | 否 |
-| `dwarf_layout_fallback` | DWARF 布局提取失败，继续使用内置布局。 | 否 |
-| `fastbin_cycle_detected` | fastbin 链成环或触及遍历上限。 | 否 |
+| `dwarf_layout_fallback` | 缺少可用的 DWARF 布局，已使用内置布局。若与目标 libc 的布局不同，arena、heap 和空闲块统计可能不准确。 | 否 |
+| `fastbin_cycle_detected` | fastbin 链重复访问同一 chunk，说明链中有环。 | 否 |
+| `fastbin_limit_exceeded` | 单条 fastbin 链超过 100 万个 chunk，只统计前 100 万个。 | 否 |
 | `fastbin_chunk_read_failed` | 读取 fastbin 头/节点失败；该 bin 计数为部分结果。 | 否 |
-| `tcache_cycle_detected` | tcache 链成环或触及遍历上限。 | 否 |
+| `tcache_cycle_detected` | tcache 链重复访问同一节点，说明链中有环。 | 否 |
+| `tcache_limit_exceeded` | 单个线程的一条 tcache 链超过 65,535 个节点，只统计前 65,535 个。 | 否 |
 | `tcache_chunk_read_failed` | 读取 tcache 头/节点失败；该 bin 为部分结果。 | 否 |
 | `duplicate_tcache_entry` | 同一 chunk 出现在两个 tcache bin/线程里（double-free 迹象）。 | 否 |
 | `chunk_read_failed` | 某 chunk 地址在 core 中没有文件内容支撑。 | 否 |
-| `heap_walk_truncated` | 堆/链表遍历提前终止（损坏、越界或触及上限）；结果为部分数据。 | 否 |
-| `stats_inconsistent` | 某尺寸桶的 fastbin 计数超过其已分配计数（通常是遍历被截断）。 | 否 |
+| `arena_limit_exceeded` | arena 数量超过 4,096，只列出前 4,096 个。 | 否 |
+| `heap_walk_truncated` | 堆/链表遍历提前终止（损坏、越界或触及上限）；结果为部分数据。主 arena 遇到双围栏时，不再扫描后续区间的 chunk。 | 否 |
+| `stats_inconsistent` | 完整遍历堆后，仍有 fastbin 节点未匹配到对应尺寸、标记为在用的块。 | 否 |
 | `thread_tls_resolution_failed` | 某线程的 TLS 无法解析；其 tcache / arena 归属缺失。 | 否 |
 
 *致命* problem 意味着分析不可信：`report` 以非零码退出，`check` 报告 `supported: false`。
 非致命 problem 则给出一份可用的报告，只是把降级的部分标注出来。
 
+fastbin 或 tcache 超限时，未遍历到的空闲块可能仍被计入 `allocated`。arena 数量超限时，
+`arena_system_bytes` 和 `total_system_bytes` 为 `null`。
+
 退出码：成功（含"带非致命 problem 恢复"）为 `0`；硬失败（core 坏、定位不到 libc、缺必需
 符号）为非零。硬失败信息写 stderr；stdout 要么是一份完整的 JSON，要么为空。
+
+如果 core 的 `NT_FILE` 记录超过 10 万条文件映射，`report` 会报错退出。
 
 ## 开发
 

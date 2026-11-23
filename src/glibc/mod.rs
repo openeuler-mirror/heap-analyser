@@ -235,9 +235,11 @@ impl DetectedLayout {
         let dwarf_elf = debug.unwrap_or(elf);
         match dwarf::extract_layout(dwarf_elf, layout.capabilities.has_tcache) {
             Ok(dwarf) => layout.apply_dwarf(dwarf),
-            Err(dwarf::DwarfLayoutError::Unavailable) if debug.is_none() => {}
             Err(error) => layout.problems.push(Problem::DwarfLayoutFallback {
-                reason: error.to_string(),
+                reason: format!(
+                    "{error}; using built-in malloc layout. If it differs from this libc, \
+                     arena, heap and free chunk statistics may be inaccurate"
+                ),
             }),
         }
         layout

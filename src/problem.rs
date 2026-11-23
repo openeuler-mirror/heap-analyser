@@ -44,12 +44,17 @@ pub enum Problem {
     MissingBuildId,
     /// glibc version detection failed; safe-linking was assumed on by default.
     UnknownGlibcVersion,
-    /// DWARF was present, but its malloc layout was unusable. The built-in
-    /// layout was kept.
+    /// DWARF malloc layout was missing or unusable; the built-in layout was kept.
     DwarfLayoutFallback { reason: String },
 
-    /// A fastbin chain looped or exceeded the traversal cap.
+    /// A fastbin chain revisited a chunk.
     FastbinCycleDetected { arena: u32, bin_index: u32 },
+    /// A fastbin had more nodes than the walk could count.
+    FastbinLimitExceeded {
+        arena: u32,
+        bin_index: u32,
+        limit: usize,
+    },
     /// Reading a fastbin head or a chain node failed; the bin count is partial.
     /// The `address` disambiguates the head-slot case from a mid-chain node.
     FastbinChunkReadFailed {
@@ -58,9 +63,15 @@ pub enum Problem {
         address: String,
     },
 
-    /// A tcache chain looped or exceeded the traversal cap. Carries `thread_id`,
+    /// A tcache chain revisited an entry. Carries `thread_id`,
     /// not `arena`: tcache is thread-local and does not belong to any arena.
     TcacheCycleDetected { thread_id: i32, bin_index: u32 },
+    /// A tcache bin had more entries than the walk could collect.
+    TcacheLimitExceeded {
+        thread_id: i32,
+        bin_index: u32,
+        limit: usize,
+    },
     /// Reading a tcache head or a chain node failed; the bin is partial.
     TcacheChunkReadFailed {
         thread_id: i32,
@@ -77,11 +88,13 @@ pub enum Problem {
 
     /// A chunk address was not backed by file content in any loaded segment.
     ChunkReadFailed { arena: u32, address: String },
+    /// The arena ring continued beyond the reported arenas.
+    ArenaLimitExceeded { limit: u32 },
     /// A heap / list walk stopped early because of corruption, an out-of-region
     /// address, or a traversal cap. The result is partial.
     HeapWalkTruncated { arena: u32, reason: String },
-    /// During accumulation a size bucket's fastbin count exceeded its allocated
-    /// count — the books don't balance, usually a symptom of a truncated walk.
+    /// A fastbin node could not be matched to an in-use chunk of the expected
+    /// size on a complete heap walk.
     StatsInconsistent {
         arena: u32,
         size: u64,

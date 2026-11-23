@@ -11,7 +11,7 @@
 //! Pull thread and mapping information out of a core dump's notes.
 
 use crate::arch::Arch;
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 use super::notes::Note;
 use super::read_word;
@@ -82,8 +82,7 @@ pub fn threads(notes: &[Note<'_>], arch: &dyn Arch) -> Result<Vec<Thread>> {
 ///
 /// Descriptor layout: `count`, `page_size`, then `count` × `(start, end,
 /// file_offset)`, then `count` NUL-terminated path strings — all in target word
-/// size. Missing note or truncation yields whatever parsed cleanly, never an
-/// error.
+/// size. Reject oversized tables; if path data is truncated, keep complete paths.
 pub fn mapped_files(notes: &[Note<'_>], is_64bit: bool) -> Result<Vec<MappedFile>> {
     let Some(note) = notes.iter().find(|n| n.note_type == NT_FILE) else {
         return Ok(Vec::new());
@@ -94,7 +93,12 @@ pub fn mapped_files(notes: &[Note<'_>], is_64bit: bool) -> Result<Vec<MappedFile
     let Some(count) = read_word(desc, 0, is_64bit) else {
         return Ok(Vec::new());
     };
-    let count = count.min(MAX_MAPPINGS);
+    if count > MAX_MAPPINGS {
+        return Err(Error::TooManyFileMappings {
+            count,
+            limit: MAX_MAPPINGS,
+        });
+    }
 
     // Fixed-size triples first, so we can then stream the variable-length paths.
     let mut ranges = Vec::new();
@@ -105,7 +109,8 @@ pub fn mapped_files(notes: &[Note<'_>], is_64bit: bool) -> Result<Vec<MappedFile
             read_word(desc, off + word, is_64bit),
             read_word(desc, off + 2 * word, is_64bit),
         ) else {
-            break;
+            // The path table starts after *all* triples. No paths are available.
+            return Ok(Vec::new());
         };
         ranges.push((start, end, file_offset));
         off += 3 * word;
@@ -177,6 +182,44 @@ mod tests {
         assert_eq!(files[0].path, "/bin/victim");
         assert_eq!(files[1].start, 0x7ffff7a00000);
         assert_eq!(files[1].path, "/lib/libc.so.6");
+    }
+
+    #[test]
+    fn accepts_the_nt_file_limit_and_rejects_larger_counts() {
+        for word in [4, 8] {
+            let mut desc = vec![0; (2 + 3 * MAX_MAPPINGS as usize) * word];
+            desc[..word].copy_from_slice(&MAX_MAPPINGS.to_le_bytes()[..word]);
+            // One short path per entry; the last must be read from the path table.
+            for _ in 0..MAX_MAPPINGS - 1 {
+                desc.extend_from_slice(b"x\0");
+            }
+            desc.extend_from_slice(b"last\0");
+            let parse = |data: &[u8]| {
+                mapped_files(
+                    &[Note {
+                        name: "CORE",
+                        note_type: NT_FILE,
+                        desc: data,
+                    }],
+                    word == 8,
+                )
+            };
+            let files = parse(&desc).unwrap();
+            assert_eq!(files.len(), MAX_MAPPINGS as usize);
+            assert_eq!(files.last().unwrap().path, "last");
+
+            desc.splice(2 * word..2 * word, vec![0; 3 * word]);
+            desc.extend_from_slice(b"extra\0");
+            let count = MAX_MAPPINGS + 1;
+            desc[..word].copy_from_slice(&count.to_le_bytes()[..word]);
+            assert!(matches!(
+                parse(&desc),
+                Err(Error::TooManyFileMappings {
+                    count: 100_001,
+                    limit: 100_000
+                })
+            ));
+        }
     }
 
     #[test]

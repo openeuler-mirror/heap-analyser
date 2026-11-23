@@ -14,13 +14,10 @@
 //!   1. tcache — a chunk whose `PREV_INUSE` says "in use" but whose user address
 //!      is in a tcache bin is actually free (glibc doesn't clear the neighbour's
 //!      bit for tcache/fastbin puts).
-//!   2. fastbins — counted from the chains, moved out of allocated into free by
-//!      nominal bin size.
+//!   2. fastbins — a walked chunk whose address is in its size's fastbin is free.
 //!   3. everything the walk marked free via a cleared `PREV_INUSE`.
 //!
-//! Pure and I/O-free: it only produces `StatsInconsistent`, when a fastbin holds
-//! more chunks of a size than were seen allocated (a truncated walk or
-//! corruption). Everything else was reported upstream.
+//! A partial heap walk only accounts for the chunks it reached.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -42,25 +39,10 @@ pub struct SizeTally {
 
 impl SizeTally {
     fn add(&mut self, size: u64) {
-        self.add_n(size, 1);
-    }
-
-    fn add_n(&mut self, size: u64, n: u64) {
-        self.count = self.count.saturating_add(n);
-        self.bytes = self.bytes.saturating_add(size.saturating_mul(n));
+        self.count = self.count.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(size);
         let e = self.histogram.entry(size).or_default();
-        *e = e.saturating_add(n);
-    }
-
-    /// Remove `n` chunks of `size`. Returns `true` if this would have gone
-    /// negative (the totals are inconsistent), clamping at zero.
-    fn remove_n(&mut self, size: u64, n: u64) -> bool {
-        let bucket = self.histogram.entry(size).or_default();
-        let underflow = self.count < n || *bucket < n;
-        self.count = self.count.saturating_sub(n);
-        self.bytes = self.bytes.saturating_sub(size.saturating_mul(n));
-        *bucket = bucket.saturating_sub(n);
-        underflow
+        *e = e.saturating_add(1);
     }
 }
 
@@ -94,6 +76,7 @@ pub fn accumulate(
     events: &[ChunkEvent],
     tcache_membership: &std::collections::HashMap<u64, (i32, u32)>,
     fastbin_results: &[FastbinBinResult],
+    walk_complete: bool,
 ) -> (ArenaStats, Vec<Problem>) {
     let header_size = u64::from(layout.header_size);
     let mut allocated = SizeTally::default();
@@ -101,6 +84,11 @@ pub fn accumulate(
     let mut tcache_threads = BTreeSet::new();
     // bin index → chunk count; the bucket size/bytes use the bin's nominal size.
     let mut tcache_counts: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut fastbin_counts: BTreeMap<_, _> = fastbin_results
+        .iter()
+        .filter(|fb| fb.count != 0)
+        .map(|fb| (fb.size, (fb, 0u64)))
+        .collect();
     let mut problems = Vec::new();
 
     for ev in events {
@@ -111,34 +99,43 @@ pub fn accumulate(
                 tcache_threads.insert(thread_id);
                 let count = tcache_counts.entry(bin_index).or_default();
                 *count = count.saturating_add(1);
-            } else {
-                allocated.add(ev.user_size);
+                continue;
             }
+            if let Some((fb, count)) = fastbin_counts.get_mut(&ev.user_size) {
+                if ev
+                    .size_field_addr
+                    .checked_sub(u64::from(layout.word_size))
+                    .is_some_and(|addr| fb.chunk_addrs.contains(&addr))
+                {
+                    free.add(ev.user_size);
+                    *count += 1;
+                    continue;
+                }
+            }
+            allocated.add(ev.user_size);
         } else {
             // Source 3: walk already saw this as free.
             free.add(ev.user_size);
         }
     }
 
-    // Source 2: move fastbin chunks from allocated to free by nominal size.
     let mut fastbins = Vec::new();
-    for fb in fastbin_results {
-        if fb.count == 0 {
-            continue;
-        }
-        if allocated.remove_n(fb.size, fb.count) {
+    for (fb, count) in fastbin_counts.into_values() {
+        if walk_complete && count != fb.count {
             problems.push(Problem::StatsInconsistent {
                 arena: arena_index,
                 size: fb.size,
-                reason: "fastbin count exceeds allocated count for this size".to_string(),
+                reason: "fastbin nodes did not match walked chunks of this size".to_string(),
             });
         }
-        free.add_n(fb.size, fb.count);
+        if count == 0 {
+            continue;
+        }
         fastbins.push(BinTally {
             index: fb.index,
             size: fb.size,
-            count: fb.count,
-            bytes: fb.size.saturating_mul(fb.count),
+            count,
+            bytes: fb.size.saturating_mul(count),
         });
     }
 
@@ -209,10 +206,11 @@ mod tests {
             index: 0,
             size: 24,
             count: 1,
+            chunk_addrs: [0x3f0].into(),
         }];
 
         let layout = test_layout(8);
-        let (stats, problems) = accumulate(&layout, 0, &events, &membership, &fastbins);
+        let (stats, problems) = accumulate(&layout, 0, &events, &membership, &fastbins, true);
         assert!(problems.is_empty(), "{problems:?}");
         // allocated: started with 0x100 and 0x400 (24 each) = 2, minus 1 fastbin = 1.
         assert_eq!(stats.allocated.count, 1);
@@ -237,17 +235,20 @@ mod tests {
     }
 
     #[test]
-    fn fastbin_exceeding_allocated_flags_inconsistency() {
+    fn unmatched_fastbin_on_complete_walk_flags_inconsistency() {
         let events = [event(0x100, 24, false)]; // one free chunk, none allocated at size 24
         let membership = HashMap::new();
         let fastbins = [FastbinBinResult {
             index: 0,
             size: 24,
             count: 2,
+            chunk_addrs: [0xf0, 0x1f0].into(),
         }];
         let layout = test_layout(8);
-        let (stats, problems) = accumulate(&layout, 1, &events, &membership, &fastbins);
-        assert_eq!(stats.allocated.count, 0); // clamped, not underflowed
+        let (stats, problems) = accumulate(&layout, 1, &events, &membership, &fastbins, true);
+        assert_eq!(stats.allocated.count, 0);
+        assert_eq!(stats.free.tally.count, 1);
+        assert!(stats.free.fastbins.is_empty());
         assert!(matches!(
             problems.as_slice(),
             [Problem::StatsInconsistent {
@@ -256,5 +257,33 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn partial_walk_counts_only_fastbin_members_in_the_walked_region() {
+        // The unwalked member has the same size as both small walked chunks.
+        let events = [
+            event(0x100, 24, true),
+            event(0x200, 24, true),
+            event(0x300, 40, true),
+        ];
+        let fb = FastbinBinResult {
+            index: 0,
+            size: 24,
+            count: 2,
+            chunk_addrs: [0x1f0, 0x3f0].into(),
+        };
+        let (stats, problems) =
+            accumulate(&test_layout(8), 0, &events, &HashMap::new(), &[fb], false);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!((stats.allocated.count, stats.allocated.bytes), (2, 64));
+        assert_eq!(stats.allocated.histogram, [(24, 1), (40, 1)].into());
+        assert_eq!((stats.free.tally.count, stats.free.tally.bytes), (1, 24));
+        assert_eq!(stats.free.tally.histogram, [(24, 1)].into());
+        assert_eq!(stats.free.fastbins[0].count, 1);
+        assert_eq!(
+            stats.allocated.count + stats.free.tally.count,
+            stats.overhead_count
+        );
     }
 }

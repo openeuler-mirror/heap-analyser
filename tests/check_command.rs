@@ -47,6 +47,23 @@ fn check_on_non_libc_elf_reports_unsupported() {
 }
 
 #[test]
+fn missing_dwarf_without_a_debug_file_reports_fallback_once() {
+    let fixture = ElfFixture::new();
+    let elf = fixture.write("libc.so.6", &minimal_elf(EM_X86_64, Some(b"id"), &[]));
+    let out = run(&["check", "--libc", &elf]);
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let mut fallbacks = json["problems"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["kind"] == "dwarf_layout_fallback");
+    let reason = fallbacks.next().unwrap()["reason"].as_str().unwrap();
+    assert!(reason.contains("DWARF debug_info is unavailable"));
+    assert!(reason.contains("may be inaccurate"));
+    assert!(fallbacks.next().is_none());
+}
+
+#[test]
 fn matching_debug_file_is_accepted_and_reports_layout_fallback() {
     let elf = non_libc_elf();
     let out = run(&["check", "--libc", elf, "--libc-debug", elf]);

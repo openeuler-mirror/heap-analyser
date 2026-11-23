@@ -22,7 +22,7 @@ use std::path::Path;
 
 use crate::arch::by_elf_machine;
 use crate::elf::coredump::{self, Thread};
-use crate::elf::{Elf, Image};
+use crate::elf::{Elf, Image, MemReader};
 use crate::error::{Error, Result};
 use crate::glibc::footprint;
 use crate::glibc::{verify_debug_matches_runtime, DetectedLayout};
@@ -111,7 +111,7 @@ pub fn analyze_core_with_debug(
     let TlsInfo {
         tcache_membership,
         thread_arena_map,
-    } = resolve_tls(&core, &layout, libc_addr, &arenas, &threads, &mut problems);
+    } = resolve_tls(&core, &layout, libc_addr, &threads, &mut problems);
 
     let mut arena_reports = Vec::new();
     let mut arena_system_values = Vec::with_capacity(arenas.len());
@@ -139,6 +139,7 @@ pub fn analyze_core_with_debug(
                 continue;
             }
         };
+        let mut walk_complete = heap_problems.is_empty();
         problems.extend(heap_problems);
 
         // All of this arena's chunks, across every heap.
@@ -153,14 +154,21 @@ pub fn analyze_core_with_debug(
                 arena.is_main(),
             );
             events.extend(evs);
+            walk_complete &= probs.is_empty();
             problems.extend(probs);
         }
 
         // Fastbins belong to the arena, so walk them once here (not per heap).
         let fastbins = walk_arena_fastbins(&core, &layout, arena, &mut problems);
 
-        let (stats, stat_problems) =
-            accumulate(&layout, arena.index, &events, &tcache_membership, &fastbins);
+        let (stats, stat_problems) = accumulate(
+            &layout,
+            arena.index,
+            &events,
+            &tcache_membership,
+            &fastbins,
+            walk_complete,
+        );
         problems.extend(stat_problems);
 
         arena_reports.push(ArenaReport::build(
@@ -204,10 +212,9 @@ struct TlsInfo {
 /// membership map and the thread→arena map. Kept out of the arena loop so a
 /// chain isn't re-walked, and a failing thread isn't re-reported, per arena.
 fn resolve_tls(
-    core: &Elf<'_>,
+    core: &impl MemReader,
     layout: &DetectedLayout,
     libc_addr: u64,
-    arenas: &[Arena],
     threads: &[Thread],
     problems: &mut Vec<Problem>,
 ) -> TlsInfo {
@@ -219,7 +226,6 @@ fn resolve_tls(
             thread_arena_map,
         };
     }
-    let main_addr = arenas.first().map(|a| a.malloc_state_addr).unwrap_or(0);
     let word = u64::from(layout.word_size);
     let entries_off = u64::from(layout.tcache_entries_offset);
 
@@ -234,11 +240,9 @@ fn resolve_tls(
 
         if layout.thread_arena.present {
             match tcache::read_thread_arena(core, layout, libc_addr, thread.tp) {
-                // A null thread_arena is glibc's "this thread uses main"; map it
-                // to main so attached_threads matches by address.
+                Ok(0) => {} // No arena binding; tcache is independent.
                 Ok(addr) => {
-                    let resolved = if addr == 0 { main_addr } else { addr };
-                    thread_arena_map.insert(thread.thread_id, resolved);
+                    thread_arena_map.insert(thread.thread_id, addr);
                 }
                 Err(_) => tls_failed = true,
             }
@@ -275,7 +279,7 @@ fn resolve_tls(
 
 #[allow(clippy::too_many_arguments)]
 fn collect_tcache(
-    core: &Elf<'_>,
+    core: &impl MemReader,
     layout: &DetectedLayout,
     base: u64,
     entries_off: u64,
@@ -368,5 +372,47 @@ fn describe(problem: &Problem) -> String {
             format!("unsupported architecture e_machine={machine:#x}")
         }
         _ => "reference libc unusable".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::glibc::test_layout;
+    use crate::heap::test_support::FakeMem;
+
+    #[test]
+    fn unbound_thread_keeps_its_tcache_without_an_arena() {
+        let mut layout = test_layout(8);
+        layout.thread_arena.value = 8;
+        layout.tcache_max_bins = 1;
+        let mut mem = FakeMem::new();
+        mem.set(0x1000, 0); // TLS relocation
+        mem.set(0x2000, 0x3000).set(0x2008, 0); // tcache, thread_arena
+        mem.set(0x3000 + u64::from(layout.tcache_entries_offset), 0x4000)
+            .set(0x4000, 0);
+        let thread = Thread {
+            pc: 0,
+            sp: 0,
+            tp: 0x2000,
+            thread_id: 7,
+        };
+        for binding in [0, 0x5000] {
+            mem.set(0x2008, binding);
+            let mut problems = Vec::new();
+            let info = resolve_tls(
+                &mem,
+                &layout,
+                0x1000,
+                std::slice::from_ref(&thread),
+                &mut problems,
+            );
+            assert!(problems.is_empty());
+            assert_eq!(
+                info.thread_arena_map.get(&7).copied(),
+                (binding != 0).then_some(binding)
+            );
+            assert_eq!(info.tcache_membership.get(&0x4000), Some(&(7, 0)));
+        }
     }
 }
