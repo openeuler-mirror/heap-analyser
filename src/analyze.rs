@@ -139,6 +139,7 @@ pub fn analyze_core_with_debug(
                 continue;
             }
         };
+        let mut walk_complete = heap_problems.is_empty();
         problems.extend(heap_problems);
 
         // All of this arena's chunks, across every heap.
@@ -153,14 +154,21 @@ pub fn analyze_core_with_debug(
                 arena.is_main(),
             );
             events.extend(evs);
+            walk_complete &= probs.is_empty();
             problems.extend(probs);
         }
 
         // Fastbins belong to the arena, so walk them once here (not per heap).
         let fastbins = walk_arena_fastbins(&core, &layout, arena, &mut problems);
 
-        let (stats, stat_problems) =
-            accumulate(&layout, arena.index, &events, &tcache_membership, &fastbins);
+        let (stats, stat_problems) = accumulate(
+            &layout,
+            arena.index,
+            &events,
+            &tcache_membership,
+            &fastbins,
+            walk_complete,
+        );
         problems.extend(stat_problems);
 
         arena_reports.push(ArenaReport::build(

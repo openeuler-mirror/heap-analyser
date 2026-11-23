@@ -217,7 +217,7 @@ These fields are `null` when they cannot be read reliably. They depend on valida
 | `allocated.count` / `.bytes` | In-use chunks and their **payload** bytes (payload = chunk size − the one-word header). |
 | `allocated.size_histogram[]` | Buckets `{ size, count, bytes = size × count }`, ascending by payload size. |
 | `free.count` / `.bytes` | Free chunks and payload bytes, across all three sources: tcache, fastbins, and ordinary free chunks (the unsorted/small/large bins and coalesced free space). |
-| `free.fastbins[]` | Per fastbin `{ index, size, count, bytes }` (payload `size`); only non-empty bins. |
+| `free.fastbins[]` | Per fastbin `{ index, size, count, bytes }` (payload `size`); only chunks found by the heap walk are counted. Empty bins are omitted. |
 | `free.tcache.tcache_threads` | Thread IDs owning the tcache entries counted here. |
 | `free.tcache.bins[]` | Per tcache bin `{ index, size, count, bytes }`; only non-empty bins. |
 | `free.size_histogram[]` | Payload-size buckets over **all** free chunks — all three sources combined. It is *not* just `fastbins` + `tcache`: it also covers ordinary free chunks, which have no dedicated array here, so it can list sizes (like the 312-byte bucket above) that appear in neither `fastbins[]` nor `tcache.bins[]`. |
@@ -260,7 +260,7 @@ ignore kinds they do not recognise. The current kinds are:
 | `chunk_read_failed` | A chunk address was not backed by file content in the core. | no |
 | `arena_limit_exceeded` | The arena ring continued beyond 4,096 arenas; the arena list is partial. | no |
 | `heap_walk_truncated` | A heap/list walk stopped early (corruption, out-of-region, or a cap); result is partial. At a double fencepost in the main arena, later regions are not scanned for chunks. | no |
-| `stats_inconsistent` | A size bucket's fastbin count exceeded its allocated count (usually a truncated walk). | no |
+| `stats_inconsistent` | A fastbin node did not match an in-use chunk of the expected size on a complete heap walk. | no |
 | `thread_tls_resolution_failed` | A thread's TLS couldn't be resolved; its tcache / arena binding is missing. | no |
 
 A *fatal* problem means the analysis is untrustworthy: `report` exits non-zero

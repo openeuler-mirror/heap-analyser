@@ -35,6 +35,8 @@ pub struct FastbinBinResult {
     pub index: u32,
     pub size: u64,
     pub count: u64,
+    /// Chunk pointers (not user pointers), also used to detect cycles during the walk.
+    pub chunk_addrs: HashSet<u64>,
 }
 
 /// Walk one fastbin from `head` (a chunk pointer). `head == 0` is an empty bin.
@@ -49,6 +51,7 @@ pub fn walk_fastbin(
         index: bin_index,
         size: fastbin_index_to_size(layout, bin_index),
         count: 0,
+        chunk_addrs: HashSet::new(),
     };
     let mut problems = Vec::new();
     if head == 0 {
@@ -56,18 +59,18 @@ pub fn walk_fastbin(
     }
 
     let fd_offset = 2 * u64::from(layout.word_size);
-    let mut visited = HashSet::new();
     let mut current = head;
 
     loop {
-        if !visited.insert(current) {
+        if !result.chunk_addrs.insert(current) {
             problems.push(Problem::FastbinCycleDetected {
                 arena: arena_index,
                 bin_index,
             });
             break;
         }
-        if visited.len() > MAX_CHAIN {
+        if result.chunk_addrs.len() > MAX_CHAIN {
+            result.chunk_addrs.remove(&current);
             problems.push(Problem::FastbinLimitExceeded {
                 arena: arena_index,
                 bin_index,
@@ -75,8 +78,6 @@ pub fn walk_fastbin(
             });
             break;
         }
-        result.count += 1;
-
         let fd_slot = current.wrapping_add(fd_offset);
         let stored = match mem.read_u64(fd_slot) {
             Ok(v) => v,
@@ -95,6 +96,7 @@ pub fn walk_fastbin(
         }
         current = next;
     }
+    result.count = result.chunk_addrs.len() as u64;
     (result, problems)
 }
 
@@ -200,6 +202,7 @@ mod tests {
             mem.set(last + fd, tail);
             let (result, problems) = walk_fastbin(&mem, &layout, head, 3, 0);
             assert_eq!(result.count, 1_000_000);
+            assert!(!result.chunk_addrs.contains(&(last + 32)));
             assert_eq!(problems, expected);
         }
     }

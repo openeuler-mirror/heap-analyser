@@ -93,8 +93,8 @@ pub enum Problem {
     /// A heap / list walk stopped early because of corruption, an out-of-region
     /// address, or a traversal cap. The result is partial.
     HeapWalkTruncated { arena: u32, reason: String },
-    /// During accumulation a size bucket's fastbin count exceeded its allocated
-    /// count — the books don't balance, usually a symptom of a truncated walk.
+    /// A fastbin node could not be matched to an in-use chunk of the expected
+    /// size on a complete heap walk.
     StatsInconsistent {
         arena: u32,
         size: u64,
